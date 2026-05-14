@@ -1,0 +1,2623 @@
+---
+title: "Replication File India Paper: Impact of Air Pollution on Birth Outcomes"
+author: "Shashank Misra"
+date: "`r Sys.Date()`"
+output: github_document
+---
+
+
+#Importing Main Dataset and Renaming Variables in Line with My regressions + All Packages
+```{r}
+library(tidyverse)
+library(haven)
+library(car)
+library(writexl)
+library(openxlsx)
+library(scales)
+library(sf)
+library(sandwich)
+library(skimr)
+library(fixest)
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggforce)
+library(lmtest)
+library(stargazer)
+library(stringr)
+library(broom)
+library(ggtext)
+library(ggforce)
+library(AER)
+#Import DHS data here, linked to merra pollution and wind direction from ERA5 and already calculated in-utero weather/pm variables
+FinalDataset <- read_dta("FinalDatasetNov18.dta") #Here use from the directory imported
+FinalDataset <- FinalDataset %>% mutate(MOBMother=MOB, YOBMother=YOB) %>% filter(code!=543) #Lakshwadeep code 543 missing weather data
+FinalDataset <- FinalDataset %>% select(-MOB,-YOB) #incorrect MOB AND YOB (is from mother not child hence do not need)
+FinalDataset <- FinalDataset %>% mutate(tri_cumulative=pm_cumulative,avg_north_share_cumulative=North_share_cumulative, avg_east_share_cumulative=East_share_cumulative, avg_south_share_cumulative=South_share_cumulative, avg_temperature_cumulative=temp_cumulative, avg_wind_speed_cumulative=windspeed_cumulative, cooking=dirty_cookingfuel, female=if_else(sex_child == 2, 1, 0), brthwt=birthweight, LBW=lbw, VLBW=vlbw, bord=birthorder, age_birth=YOB_child-YOBMother,anemia=anemic, avg_west_share_cumulative=West_share_cumulative, YOB=YOB_child,MOB=MOB_child,religion=religion_code,minoritycastetribe=caste)  # No in-utero variables for 2009, hence filter 2010 after sept (NOW RESOLVED FULL DF AVAILABLE INCLUDING ALL 2009 BIRTHS)
+
+```
+
+#Give Summary Stats
+```{r}
+
+FinalDatasetSummary <- FinalDataset %>%
+  mutate(
+    # Religion dummies
+    hindu = if_else(religion_code == 1, 1, 0),
+    muslim = if_else(religion_code == 2, 1, 0),
+    christian = if_else(religion_code == 3, 1, 0),
+    other_religion = if_else(!(religion_code %in% c(1, 2, 3)), 1, 0),
+    # Caste dummies
+    scheduled_tribe = if_else(caste == 2, 1, 0),
+    obc = if_else(caste == 3, 1, 0),
+    scheduled_caste = if_else(caste == 1, 1, 0),
+    other_caste = if_else(!(caste %in% c(1, 2, 3)), 1, 0),
+    # Dirty fuel dummy based on v161
+    dirty_fuel = cooking
+  )
+
+
+# Select all variables of interest
+summary_vars <- FinalDatasetSummary %>%
+  select(
+    hindu, muslim, christian, other_religion,
+    scheduled_tribe, obc, scheduled_caste, other_caste,
+    dirty_fuel,
+    sex_child, urban , bmi, wealth_index, anemia,
+    birthorder, age_birth, MOB_child, YOB_child, lbw, vlbw, birthweight, tri_cumulative
+  )
+
+
+
+#Simple summary stats
+summary(summary_vars)
+
+
+
+```
+#Baseline IV Results
+
+```{r}
+# First-stage regression (cumulative)
+FinalDataset$religion <- as.factor(FinalDataset$religion)
+FinalDataset$cooking <- as.factor(FinalDataset$cooking)
+FinalDataset$minoritycastetribe <- as.factor(FinalDataset$minoritycastetribe)
+FinalDataset$wealth_index <- as.factor(FinalDataset$wealth_index)
+FinalDataset$anemia <- as.factor(FinalDataset$anemia)
+
+
+FinalDatasetFiltered <- FinalDataset %>% filter(brthwt<5500,brthwt>900) 
+FinalDataset$religion <- factor(FinalDataset$religion)
+
+first_stage <- lm(
+  tri_cumulative ~ avg_north_share_cumulative:factor(region) +
+                   avg_east_share_cumulative:factor(region)  +   avg_south_share_cumulative:factor(region)  + avg_wind_speed_cumulative +religion+minoritycastetribe+cooking+female+urban+bmi+wealth_index+ anemia + +avg_temperature_cumulative+ factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+  data = FinalDataset
+)
+
+instr_vars <- grep("avg_north_share_cumulative|avg_east_share_cumulative|avg_south_share_cumulative", 
+                   names(coef(first_stage)), value = TRUE)
+
+
+# Save the predicted values of tri_cumulative
+FinalDataset$tri_cumulative_hat <- predict(first_stage)
+
+# Save the first-stage residuals
+FinalDataset$first_stage_residuals <- residuals(first_stage)
+
+
+
+### WITH CLUSTERED ROBUST F STAT
+
+
+
+# Compute clustered robust standard errors at the district level
+vcov_clustered <- vcovCL(first_stage, cluster = ~district_matched, type = "HC1") #note that district_matched can be interchanged with code essentially the same ID for municipalities (districts)
+
+# Run Wald test using clustered SE
+f_test_clustered <- linearHypothesis(first_stage, instr_vars, vcov = vcov_clustered)
+
+# Display test results
+print(f_test_clustered)
+
+# Extract the clustered F-statistic
+f_stat_clustered <- f_test_clustered$F[2]
+print(f_stat_clustered)
+
+
+# Display results with clustered standard errors
+summary_clusteredfirststage <- coeftest(first_stage, vcov. = vcov_clustered)
+
+```
+
+
+
+
+```{r}
+
+
+library(sandwich)
+library(lmtest)
+library(stargazer)
+# Second-stage regression (cumulative)
+# Define the Tropic of Cancer latitude as a dividing line
+tropic_of_cancer <- 23.5
+FinalDatasetFiltered <- FinalDataset %>% filter(brthwt<5500,brthwt>900) %>% mutate(wood=ifelse(cooking==8,1,0))
+FinalDatasetFilteredExtremes <- FinalDataset%>% filter(brthwt<5500,brthwt>900) 
+FinalDatasetFilteredBord1 <- FinalDataset %>% filter(bord<2)
+FinalDatasetFilteredCard <- FinalDataset %>% filter(card_recall==1)
+FinalDatasetFilteredWealthTop <- FinalDataset %>% filter(wealth_index>3)
+FinalDatasetFilteredWealthBottom <- FinalDataset %>% filter(wealth_index<3)
+FinalDatasetFilteredUrban <- FinalDataset %>% filter(urban==1)
+FinalDatasetFilteredRural <- FinalDataset %>% filter(urban!=1)
+FinalDatasetFilteredHighPollution <- FinalDataset %>% filter(tri_cumulative>40)
+
+
+
+
+second_stage <- lm(
+    brthwt ~ tri_cumulative_hat + avg_temperature_cumulative  + avg_wind_speed_cumulative +minoritycastetribe+religion+cooking+female+urban+bmi+wealth_index+anemia + factor(region):factor(MOB) + factor(YOB) + bord + age_birth ,
+  data = FinalDataset
+)
+
+
+cluster_se <- vcovCL(second_stage, cluster = ~district_matched, type='HC1')
+
+
+summary_clustered <- coeftest(second_stage, vcov. = cluster_se)
+
+
+stargazer(
+  second_stage,
+  se = list(sqrt(diag(cluster_se))),
+  type = "text", omit='factor',
+  title = "Second-Stage Regression with Clustered SE at District Level"
+)
+
+```
+
+```{r}
+
+
+LBWbaselineIV <- lm(
+  LBW ~ tri_cumulative_hat + avg_temperature_cumulative  +
+          avg_wind_speed_cumulative + minoritycastetribe + religion + cooking + female +
+          urban + bmi + wealth_index + anemia + factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+  data = FinalDataset)
+
+
+
+
+
+VLBWbaselineIV <- lm(
+  VLBW ~ tri_cumulative_hat + avg_temperature_cumulative  +
+          avg_wind_speed_cumulative + minoritycastetribe + religion + cooking + female +
+          urban + bmi + wealth_index + anemia + factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+  data = FinalDataset 
+)
+
+
+
+
+cluster_se1 <- vcovCL(LBWbaselineIV, cluster = ~district_matched, type='HC1')
+summary_clustered1 <- coeftest(LBWbaselineIV, vcov. = cluster_se1)
+
+
+
+cluster_se2 <- vcovCL(VLBWbaselineIV, cluster = ~district_matched, type = "HC1")
+summary_clustered2 <- coeftest(VLBWbaselineIV, vcov. = cluster_se2)
+
+
+stargazer(
+  LBWbaselineIV, VLBWbaselineIV,
+  type = "text",
+  title = "LBW VLBW IV BASELINE",
+  omit = "factor",  
+  star.cutoffs = c(0.1, 0.05, 0.01),digits=4  
+)
+
+
+
+```
+
+
+#Exporting Baseline First Stage and Second Stage Results to Excel
+`{r}
+
+summary_dffirststage <- as.data.frame(summary_clusteredfirststage[,])
+summary_dffirststage$Variable <- rownames(summary_clusteredfirststage)
+summary_dfbw <- as.data.frame(summary_clustered[,])
+summary_dfbw$Variable <- rownames(summary_clustered)
+summary_dfLBW <- as.data.frame(summary_clustered1[,])
+summary_dfLBW$Variable <- rownames(summary_clustered1)
+summary_dfVLBW <- as.data.frame(summary_clustered2[,])
+summary_dfVLBW$Variable <- rownames(summary_clustered2)
+
+
+
+# Save each data frame to a separate Excel file
+write_xlsx(summary_dffirststage, "first_stage_results.xlsx")
+write_xlsx(summary_dfbw, "birth_weight_results.xlsx")
+write_xlsx(summary_dfLBW, "low_birth_weight_results.xlsx")
+write_xlsx(summary_dfVLBW, "very_low_birth_weight_results.xlsx")
+
+
+
+
+`
+
+
+#OLS Results
+
+```{r}
+
+LBWFE <- lm(
+  LBW ~ tri_cumulative + avg_temperature_cumulative  +
+          avg_wind_speed_cumulative + minoritycastetribe + religion + cooking + female +
+          urban + bmi + wealth_index + anemia + factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+  data = FinalDataset)
+
+
+
+
+VLBWFE <- lm(
+  VLBW ~ tri_cumulative + avg_temperature_cumulative  +
+          avg_wind_speed_cumulative + minoritycastetribe + religion + cooking + female +
+          urban + bmi + wealth_index + anemia + factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+  data = FinalDataset 
+)
+
+
+
+cluster_se1FE <- vcovCL(LBWFE, cluster = ~district_matched, type='HC1')
+summary_clustered1FE <- coeftest(LBWFE, vcov. = cluster_se1FE)
+
+
+cluster_se2FE <- vcovCL(VLBWFE, cluster = ~district_matched, type = "HC1")
+summary_clustered2FE<- coeftest(VLBWFE, vcov. = cluster_se2FE)
+
+second_stageFE <- lm(
+    brthwt ~  tri_cumulative + avg_temperature_cumulative + avg_wind_speed_cumulative +minoritycastetribe+religion+cooking+female+urban+bmi+wealth_index+anemia + factor(region)+factor(MOB) + factor(YOB) + bord +age_birth,
+  data = FinalDataset
+)
+
+cluster_seFE <- vcovCL(second_stageFE, cluster = ~district_matched,type='HC1')
+
+summary_clusteredFE <- coeftest(second_stageFE, vcov. = cluster_seFE)
+
+stargazer(
+  second_stageFE,
+  se = list(sqrt(diag(cluster_seFE))),
+  type = "text", omit='factor',
+  title = "Second-Stage Regression OLS with Clustered SE at District Level"
+)
+
+
+stargazer(
+  LBWFE,VLBWFE,digits=5,
+  se = list(sqrt(diag(cluster_se1FE)), sqrt(diag(cluster_se2FE))),
+  type = "text", omit='factor',
+  title = "OLS regs Clustered SE at District Level"
+)
+
+```
+#Hausman Test OLS vs Baseline IV
+```{r}
+
+#Hausman BW
+b_olsbw  <- summary_clusteredFE["tri_cumulative", "Estimate"]
+se_olsbw <- summary_clusteredFE["tri_cumulative", "Std. Error"]
+
+b_ivbw  <- summary_clustered["tri_cumulative_hat", "Estimate"]
+se_ivbw <- summary_clustered["tri_cumulative_hat", "Std. Error"]
+var_olsbw <- se_olsbw^2
+var_ivbw  <- se_ivbw^2
+
+H_statbw  <- (b_ivbw - b_olsbw)^2 / (var_ivbw - var_olsbw)
+p_valuebw <- pchisq(H_statbw, df = 1, lower.tail = FALSE)
+
+H_statbw
+p_valuebw
+
+
+
+#Hausman OLS IV LBW
+b_olslbw  <- summary_clustered1FE["tri_cumulative", "Estimate"]
+se_olslbw <- summary_clustered1FE["tri_cumulative", "Std. Error"]
+
+
+b_ivlbw  <- summary_clustered1["tri_cumulative_hat", "Estimate"]
+se_ivlbw <- summary_clustered1["tri_cumulative_hat", "Std. Error"]
+var_olslbw <- se_olslbw^2
+var_ivlbw  <- se_ivlbw^2
+
+H_statlbw  <- (b_ivlbw - b_olslbw)^2 / (var_ivlbw - var_olslbw)
+p_valuelbw <- pchisq(H_statlbw, df = 1, lower.tail = FALSE)
+
+H_statlbw
+p_valuelbw
+
+
+# OLS / FE estimate (efficient under H0)
+b_olsvlbw  <- summary_clustered2FE["tri_cumulative", "Estimate"]
+se_olsvlbw <- summary_clustered2FE["tri_cumulative", "Std. Error"]
+
+# IV estimate (always consistent)
+b_ivvlbw  <- summary_clustered2["tri_cumulative_hat", "Estimate"]
+se_ivvlbw <- summary_clustered2["tri_cumulative_hat", "Std. Error"]
+var_olsvlbw <- se_olsvlbw^2
+var_ivvlbw  <- se_ivvlbw^2
+
+H_statvlbw  <- (b_ivvlbw - b_olsvlbw)^2 / (var_ivvlbw - var_olsvlbw)
+p_valuevlbw <- pchisq(H_statvlbw, df = 1, lower.tail = FALSE)
+
+H_statvlbw
+p_valuevlbw
+
+
+```
+
+
+
+#Monotonicity 40 regions
+#40
+```{r}
+first_stagenew40 <- lm(
+  tri_cumulative ~ avg_north_share_cumulative:factor(regionnew40) +
+                   avg_east_share_cumulative:factor(regionnew40) + 
+                   avg_south_share_cumulative:factor(regionnew40) +
+                   avg_temperature_cumulative  + avg_wind_speed_cumulative +religion+minoritycastetribe+cooking+female+urban+bmi+wealth_index+anemia + factor(regionnew40):factor(MOB) + factor(YOB)+bord+age_birth,
+  data = FinalDataset
+)
+
+
+
+FinalDataset$tri_cumulative_hatnew40 <- predict(first_stagenew40)
+
+FinalDataset$first_stage_residuals40 <- residuals(first_stagenew40)
+
+second_stagenew40 <- lm(
+    brthwt ~ tri_cumulative_hatnew40 + avg_temperature_cumulative  + avg_wind_speed_cumulative +minoritycastetribe+religion+cooking+female+urban+bmi+wealth_index+anemia + factor(regionnew40):factor(MOB) + factor(YOB) + bord +age_birth,
+  data = FinalDataset
+)
+
+
+cluster_senew40<- vcovCL(second_stagenew40, cluster = ~district_matched,type='HC1')
+
+
+summary_clusterednew40 <- coeftest(second_stagenew40, vcov. = cluster_senew40)
+
+
+
+
+LBWIV40 <- lm(
+  LBW ~ tri_cumulative_hatnew40 + avg_temperature_cumulative +
+          avg_wind_speed_cumulative + minoritycastetribe + religion + cooking + female +
+          urban + bmi + wealth_index + anemia + factor(regionnew40):factor(MOB) + factor(YOB) + bord + age_birth,
+  data = FinalDataset)
+
+
+
+
+VLBWIV40<- lm(
+  VLBW ~ tri_cumulative_hatnew40 + avg_temperature_cumulative +
+          avg_wind_speed_cumulative + minoritycastetribe + religion + cooking + female +
+          urban + bmi + wealth_index + anemia + factor(regionnew40):factor(MOB) + factor(YOB) + bord + age_birth,
+  data = FinalDataset  
+)
+
+
+
+cluster_se1new40 <- vcovCL(LBWIV40, cluster = ~district_matched, type='HC1')
+summary_clustered1new40 <- coeftest(LBWIV40, vcov. = cluster_se1new40)
+
+
+cluster_se2new40 <- vcovCL(VLBWIV40, cluster = ~district_matched, type = "HC1")
+summary_clustered2new40<- coeftest(VLBWIV40, vcov. = cluster_se2new40)
+
+
+stargazer(
+  second_stagenew40,
+  se = list(sqrt(diag(cluster_senew40))),
+  type = "text", omit='factor',
+  title = "Second-Stage Regression with Clustered SE at District Level"
+)
+
+stargazer(
+  LBWIV40, VLBWIV40,
+  se = list(sqrt(diag(cluster_se1new40)), sqrt(diag(cluster_se2new40))), digits=5,  
+  type = "text",
+  title = "40 REGION RESULTS",
+  omit = "factor",  
+  star.cutoffs = c(0.1, 0.05, 0.01)  
+)
+
+
+
+
+```
+
+#50 Regions
+```{r}
+first_stagenew50 <- lm(
+  tri_cumulative ~ avg_north_share_cumulative:factor(regionnew50) +
+                   avg_east_share_cumulative:factor(regionnew50) + 
+                   avg_south_share_cumulative:factor(regionnew50) +
+                   avg_temperature_cumulative + avg_wind_speed_cumulative +religion+minoritycastetribe+cooking+female+urban+bmi+wealth_index+anemia + factor(regionnew50):factor(MOB) +factor(YOB)+bord+age_birth,
+  data = FinalDataset
+)
+
+
+
+FinalDataset$tri_cumulative_hatnew50 <- predict(first_stagenew50)
+
+FinalDataset$first_stage_residuals50 <- residuals(first_stagenew50)
+
+
+second_stagenew50 <- lm(
+    brthwt ~ tri_cumulative_hatnew50 + avg_temperature_cumulative + avg_wind_speed_cumulative +minoritycastetribe+religion+cooking+female+urban+bmi+wealth_index+anemia + factor(regionnew50):factor(MOB) + factor(YOB) + bord +age_birth,
+  data = FinalDataset
+)
+
+cluster_senew50<- vcovCL(second_stagenew50, cluster = ~district_matched, type='HC1')
+
+
+summary_clusterednew50 <- coeftest(second_stagenew50, vcov. = cluster_senew50)
+
+
+
+LBWIV50 <- lm(
+  LBW ~ tri_cumulative_hatnew50 + avg_temperature_cumulative  +
+          avg_wind_speed_cumulative + minoritycastetribe + religion + cooking + female +
+          urban + bmi + wealth_index + anemia + factor(regionnew50):factor(MOB) + factor(YOB) + bord + age_birth,
+  data = FinalDataset)
+
+
+
+VLBWIV50 <- lm(
+  VLBW ~ tri_cumulative_hatnew50 + avg_temperature_cumulative  +
+          avg_wind_speed_cumulative + minoritycastetribe + religion + cooking + female +
+          urban + bmi + wealth_index + anemia + factor(regionnew50):factor(MOB) + factor(YOB) + bord + age_birth ,
+  data = FinalDataset
+)
+
+
+cluster_se1new50 <- vcovCL(LBWIV50, cluster = ~district_matched, type='HC1')
+summary_clustered1new50 <- coeftest(LBWIV50, vcov. = cluster_se1new50)
+
+
+cluster_se2new50 <- vcovCL(VLBWIV50, cluster = ~district_matched, type = "HC1")
+summary_clustered2new50<- coeftest(VLBWIV50, vcov. = cluster_se2new50)
+
+
+stargazer(
+  second_stagenew50,
+  se = list(sqrt(diag(cluster_senew50))),
+  type = "text", omit='factor',
+  title = "Second-Stage Regression with Clustered SE at District Level"
+)
+
+stargazer(
+  LBWIV50, VLBWIV50,
+  se = list(sqrt(diag(cluster_se1new50)), sqrt(diag(cluster_se2new50))),  digits=4,
+  type = "text",
+  title = "50 REGION RESULTS",
+  omit = "factor",  
+  star.cutoffs = c(0.1, 0.05, 0.01)  
+)
+
+
+
+
+```
+
+#60 
+
+```{r}
+
+first_stagenew60 <- lm(
+  tri_cumulative ~ avg_north_share_cumulative:factor(regionnew) +
+                   avg_east_share_cumulative:factor(regionnew) + 
+                   avg_south_share_cumulative:factor(regionnew) +
+                   avg_temperature_cumulative + avg_wind_speed_cumulative +religion+minoritycastetribe+cooking+female+urban+bmi+wealth_index+anemia + factor(regionnew):factor(MOB) +factor(YOB)+bord+age_birth,
+  data = FinalDataset
+)
+
+
+
+FinalDataset$tri_cumulative_hatnew <- predict(first_stagenew60)
+
+
+FinalDataset$first_stage_residuals60 <- residuals(first_stagenew60)
+
+
+second_stagenew <- lm(
+    brthwt ~ tri_cumulative_hatnew + avg_temperature_cumulative + avg_wind_speed_cumulative +minoritycastetribe+religion+cooking+female+urban+bmi+wealth_index+anemia + factor(regionnew):factor(MOB) + factor(YOB) + bord +age_birth,
+  data = FinalDataset
+)
+
+
+cluster_senew <- vcovCL(second_stagenew, cluster = ~district_matched, type='HC1')
+
+summary_clusterednew <- coeftest(second_stagenew, vcov. = cluster_senew)
+
+
+
+
+LBWIV60<- lm(
+  LBW ~ tri_cumulative_hatnew + avg_temperature_cumulative +
+          avg_wind_speed_cumulative + minoritycastetribe + religion + cooking + female +
+          urban + bmi + wealth_index + anemia + factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+  data = FinalDataset)
+
+
+
+VLBWIV60 <- lm(
+  VLBW ~ tri_cumulative_hatnew + avg_temperature_cumulative  +
+          avg_wind_speed_cumulative + minoritycastetribe + religion + cooking + female +
+          urban + bmi + wealth_index + anemia + factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+  data = FinalDataset
+)
+
+
+
+
+
+cluster_se1new <- vcovCL(LBWIV60, cluster = ~district_matched, type='HC1')
+summary_clustered1new <- coeftest(LBWIV60, vcov. = cluster_se1new)
+
+cluster_se2new <- vcovCL(VLBWIV60, cluster = ~district_matched, type = "HC1")
+summary_clustered2new<- coeftest(VLBWIV60, vcov. = cluster_se2new)
+
+
+
+
+stargazer(second_stagenew,
+  LBWIV60, VLBWIV60,
+  se = list(sqrt(diag(cluster_senew)), sqrt(diag(cluster_se1new)), sqrt(diag(cluster_se2new))),  digits=4,
+  type = "text",
+  title = "REGION 60 RESULTS",
+  omit = "factor",  
+  star.cutoffs = c(0.1, 0.05, 0.01)  
+)
+```
+#Creating Monotonicity Figures
+
+```{r}
+#FOR BW
+
+#extract Coefficients + Clustered Standard Errors
+extract_coefs <- function(summary_model, var_name, regions) {
+  est <- summary_model[var_name, 1]  # Extract Coefficient
+  se <- summary_model[var_name, 2]   # Extract Clustered Standard Error
+  return(data.frame(Regions = regions, Estimate = est, SE = se))
+}
+
+# Create a dataframe with all models
+coef_data <- bind_rows(
+  extract_coefs(summary_clustered, "tri_cumulative_hat", 30),
+  extract_coefs(summary_clusterednew, "tri_cumulative_hatnew", 60),
+  extract_coefs(summary_clusterednew50, "tri_cumulative_hatnew50", 50),
+  extract_coefs(summary_clusterednew40, "tri_cumulative_hatnew40", 40),
+)
+
+# Create the Coefficient Plot
+ggplot(coef_data, aes(x = factor(Regions), y = Estimate, color = factor(Regions))) +
+  geom_point(size = 3) +  # Plot coefficients
+  geom_errorbar(aes(ymin = Estimate - 1.96 * SE, ymax = Estimate + 1.96 * SE), width = 0.2, size=1.3) +  # 95% CI
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red",size=1.5) +  # Reference Line at 0
+  scale_color_manual(values = c("blue", "red", "green", "orange", "pink")) +  # Custom colors
+  labs(
+    title = "Robustness: Instrumental Variation Over Differential Number of Regions",
+    x = "Number of Geographical Regions For Instruments",
+    y = "Coefficient Estimate",
+    color = "Regions"
+  ) +
+  theme_minimal() +  # Clean theme
+  theme(legend.position = "bottom")
+
+
+
+
+
+# FOR LBW
+
+# Create a dataframe with only 30, 40, 50  and 60 region models
+coef_data <- bind_rows(
+  extract_coefs(summary_clustered1, "tri_cumulative_hat", 30),
+  extract_coefs(summary_clustered1new50, "tri_cumulative_hatnew50", 50),
+  extract_coefs(summary_clustered1new40, "tri_cumulative_hatnew40", 40),
+  extract_coefs(summary_clustered1new, "tri_cumulative_hatnew", 60)
+)
+
+#creating the Coefficient Plot
+ggplot(coef_data, aes(x = factor(Regions), y = Estimate, color = factor(Regions))) +
+  geom_point(size = 3) +  # Plot coefficients
+  geom_errorbar(aes(ymin = Estimate - 1.96 * SE, ymax = Estimate + 1.96 * SE), width = 0.2, size = 1.3) +  # 95% CI
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red", size = 1.5) +  # Reference Line at 0
+  scale_color_manual(values = c("blue", "red", "green", "orange", "pink")) +  # Custom colors for 30, 40, 50
+  labs(
+    title = "Robustness: Instrumental Variation Over Differential Number of Regions",
+    x = "Number of Geographical Regions",
+    y = "Coefficient Estimate",
+    color = "Regions"
+  ) +
+  theme_minimal() + 
+  theme(legend.position = "bottom")
+
+#FOR VLBW
+
+
+coef_data <- bind_rows(
+  extract_coefs(summary_clustered2, "tri_cumulative_hat", 30),
+  extract_coefs(summary_clustered2new50, "tri_cumulative_hatnew50", 50),
+  extract_coefs(summary_clustered2new40, "tri_cumulative_hatnew40", 40),
+  extract_coefs(summary_clustered2new, "tri_cumulative_hatnew", 60)
+)
+
+ggplot(coef_data, aes(x = factor(Regions), y = Estimate, color = factor(Regions))) +
+  geom_point(size = 3) +  # Plot coefficients
+  geom_errorbar(aes(ymin = Estimate - 1.96 * SE, ymax = Estimate + 1.96 * SE), width = 0.2, size = 1.3) +  # 95% CI
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red", size = 1.5) +  # Reference Line at 0
+  scale_color_manual(values = c("blue", "red", "green", "orange", "pink")) +  # Custom colors for 30, 40, 50
+  labs(
+    title = "Robustness: Instrumental Variation Over Differential Number of Regions",
+    x = "Number of Geographical Regions",
+    y = "Coefficient Estimate",
+    color = "Regions"
+  ) +
+  theme_minimal() + 
+  theme(legend.position = "bottom")
+
+```
+
+
+
+#Alternative Clustering (Deterministic Hierarchial) 30 Regions based on Hierarchical Clustering
+```{r}
+first_stagehi <- lm(
+  tri_cumulative ~ avg_north_share_cumulative:factor(region30hi) +
+                   avg_east_share_cumulative:factor(region30hi) +    avg_south_share_cumulative:factor(region30hi) + 
+                   avg_temperature_cumulative + avg_wind_speed_cumulative +religion+minoritycastetribe+cooking+female+urban+bmi+wealth_index+anemia + factor(region30hi):factor(MOB) + factor(YOB)+bord+age_birth,
+  data = FinalDataset
+)
+
+instr_varshi <- grep("avg_north_share_cumulative|avg_east_share_cumulative|avg_south_share_cumulative", 
+                   names(coef(first_stagehi)), value = TRUE)
+
+
+
+vcov_clusteredhi <- vcovCL(first_stagehi, cluster = ~district_matched, type = "HC1")
+
+
+f_test_clusteredhi <- linearHypothesis(first_stagehi, instr_varshi, vcov = vcov_clusteredhi)
+
+
+print(f_test_clusteredhi)
+
+f_stat_clusteredhi <- f_test_clusteredhi$F[2]
+print(f_stat_clusteredhi)
+
+
+
+FinalDataset$tri_cumulative_hathi <- predict(first_stagehi)
+
+second_stagehi <- lm(
+    brthwt ~ tri_cumulative_hathi + avg_temperature_cumulative  + avg_wind_speed_cumulative +minoritycastetribe+religion+cooking+female+urban+bmi+wealth_index+anemia + factor(region30hi):factor(MOB) + factor(YOB) + bord +age_birth ,
+  data = FinalDataset
+)
+
+cluster_sehi <- vcovCL(second_stagehi, cluster = ~district_matched, type='HC1')
+
+summary_clusteredhi <- coeftest(second_stagehi, vcov. = cluster_sehi)
+
+
+second_stagehiLBW <- lm(
+    LBW ~ tri_cumulative_hathi + avg_temperature_cumulative +  avg_wind_speed_cumulative +minoritycastetribe+religion+cooking+female+urban+bmi+wealth_index+anemia + factor(region30hi) :factor(MOB) + factor(YOB) + bord +age_birth ,
+  data = FinalDataset
+)
+
+
+cluster_sehiLBW <- vcovCL(second_stagehiLBW, cluster = ~district_matched, type='HC1')
+
+
+summary_clusteredhiLBW <- coeftest(second_stagehiLBW, vcov. = cluster_sehiLBW)
+
+second_stagehiVLBW <- lm(
+    VLBW ~ tri_cumulative_hathi + avg_temperature_cumulative +  avg_wind_speed_cumulative +minoritycastetribe+religion+cooking+female+urban+bmi+wealth_index+anemia + factor(region30hi) :factor(MOB) + factor(YOB) + bord +age_birth ,
+  data = FinalDataset
+)
+
+
+cluster_sehiVLBW <- vcovCL(second_stagehiVLBW, cluster = ~district_matched, type='HC1')
+
+
+summary_clusteredhiVLBW <- coeftest(second_stagehiVLBW, vcov. = cluster_sehiVLBW)
+
+
+
+
+stargazer(
+  second_stagehi,second_stagehiLBW, second_stagehiVLBW,
+  se = list(sqrt(diag(cluster_sehi)),sqrt(diag(cluster_sehiLBW)), sqrt(diag(cluster_sehiVLBW))),
+  type = "text", omit='factor',
+  title = "IV results from Hierarhcial Clustering (30 Regions)", keep = c('tri_cumulative_hathi'),
+  digits = 4
+)
+
+```
+
+
+#Most predictive Wind Direction Per region and re-running first stage and second stages
+
+#most polluting direction
+```{r}
+
+model <-  lm(
+  tri_cumulative ~ avg_north_share_cumulative:factor(region) +
+                   avg_east_share_cumulative:factor(region)  +   avg_south_share_cumulative:factor(region)  + 
+                   avg_temperature_cumulative  + avg_wind_speed_cumulative +religion+minoritycastetribe+cooking+female+urban+bmi+wealth_index+ anemia + factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+  data = FinalDataset
+)                    
+                    
+                    
+# Extract coefficients
+coefs <- summary(model)$coefficients
+coef_names <- rownames(coefs)
+
+# Identify wind-direction × region interaction terms to ensure strongest is selected
+interaction_rows <- coef_names[
+  str_detect(coef_names, "avg_(north|east|south)_share_cumulative.*factor\\(region\\)|factor\\(region\\).*avg_(north|east|south)_share_cumulative")
+]
+
+# Build data frame with direction, region, and coefficient
+wind_coefs <- data.frame(
+  term = interaction_rows,
+  coef = coefs[interaction_rows, "Estimate"]
+)
+
+# Extract direction and region from term
+wind_coefs$direction <- str_extract(wind_coefs$term, "north|east|south")
+wind_coefs$region <- as.numeric(str_extract(wind_coefs$term, "(?<=factor\\(region\\))\\d+"))
+
+# Get direction with largest absolute coefficient per region
+best_direction_by_region <- wind_coefs %>%
+  group_by(region) %>%
+  slice_max(order_by = abs(coef), n = 1)
+
+# View results
+print(best_direction_by_region)
+
+
+
+
+```
+
+```{r}
+best_direction_by_region <- best_direction_by_region %>% select(-term)
+
+# Ensure region columns are both character (to avoid matching issues)
+FinalDataset$region <- as.character(FinalDataset$region)
+best_direction_by_region$region <- as.character(best_direction_by_region$region)
+
+# Merge direction info into FinalDataset
+FinalDataset <- FinalDataset %>%
+  left_join(best_direction_by_region, by = "region")  # Adds `direction` column
+
+# Create windmost column based on the direction
+FinalDataset$windmost <- NA
+
+# For each direction, assign the corresponding wind share
+for (dir in c("north", "east", "south")) {
+  colname <- paste0("avg_", dir, "_share_cumulative")
+  FinalDataset$windmost[FinalDataset$direction == dir] <- 
+    FinalDataset[[colname]][FinalDataset$direction == dir]
+}
+
+```
+
+
+```{r}
+first_stagewindmost <- lm(
+  tri_cumulative ~ windmost:factor(region) +
+                   avg_temperature_cumulative + avg_wind_speed_cumulative +
+                   religion + minoritycastetribe + cooking + female + urban + bmi +
+                   wealth_index + anemia + factor(region):factor(MOB) + factor(YOB) +
+                   bord + age_birth,
+  data = FinalDataset
+)
+
+
+
+instr_varswindmost <- grep("windmost", 
+                   names(coef(first_stagewindmost)), value = TRUE)
+
+vcov_clusteredwindmost <- vcovCL(first_stagewindmost, cluster = ~district_matched, type = "HC1")
+
+
+f_test_clusteredwindmost <- linearHypothesis(first_stagewindmost, instr_varswindmost, vcov = vcov_clusteredwindmost)
+
+print(f_test_clusteredwindmost)
+
+
+f_stat_clusteredwindmost <- f_test_clusteredwindmost$F[2]
+print(f_stat_clusteredwindmost)
+
+
+
+
+
+FinalDataset$tri_cumulative_hatwindmost <- predict(first_stagewindmost)
+
+second_stagewindmostBW <- lm(
+    brthwt ~ tri_cumulative_hatwindmost  + avg_wind_speed_cumulative +minoritycastetribe+religion+cooking+female+urban+bmi+wealth_index+anemia + factor(region):factor(MOB) + factor(YOB) + bord +age_birth ,
+  data = FinalDataset
+)
+
+second_stagewindmostLBW <- lm(
+    LBW ~ tri_cumulative_hatwindmost   + avg_wind_speed_cumulative +minoritycastetribe+religion+cooking+female+urban+bmi+wealth_index+anemia + factor(region):factor(MOB) + factor(YOB) + bord +age_birth ,
+  data = FinalDataset
+)
+
+second_stagewindmostVLBW <- lm(
+   VLBW ~ tri_cumulative_hatwindmost   + avg_wind_speed_cumulative +minoritycastetribe+religion+cooking+female+urban+bmi+wealth_index+anemia + factor(region):factor(MOB) + factor(YOB) + bord +age_birth ,
+  data = FinalDataset
+)
+
+
+
+
+cluster_se_bw <- vcovCL(second_stagewindmostBW, cluster = ~district_matched, type='HC1')
+summary_clusteredwindmostBW <- coeftest(second_stagewindmostBW, vcov. = cluster_se_bw)
+
+cluster_se_lbw <- vcovCL(second_stagewindmostLBW,
+                         cluster = ~ district_matched,
+                         type = "HC1")
+
+summary_clusteredwindmostLBW <- coeftest(second_stagewindmostLBW,
+                                         vcov. = cluster_se_lbw)
+
+cluster_se_vlbw <- vcovCL(second_stagewindmostVLBW,
+                          cluster = ~ district_matched,
+                          type = "HC1")
+summary_clusteredwindmostVLBW <- coeftest(second_stagewindmostVLBW,
+                                          vcov. = cluster_se_vlbw)
+
+
+stargazer(
+  second_stagewindmostBW, second_stagewindmostLBW, second_stagewindmostVLBW,
+  se = list(
+  sqrt(diag(cluster_se_bw)),
+  sqrt(diag(cluster_se_lbw)), sqrt(diag(cluster_se_vlbw))
+),
+  type = "text",
+  title = "Second-Stage IV Results with Clustered Standard Errors",
+  column.labels = c("Birth Weight", "LBW",'VLBW'),
+  dep.var.labels.include = FALSE,
+  keep = c("tri_cumulative_hatwindmost"),
+  covariate.labels = c("Predicted PM2.5 (IV)"),
+  add.lines = list(c('First stage F-statistic', f_stat_clusteredwindmost,f_stat_clusteredwindmost,f_stat_clusteredwindmost)),
+  omit.stat = c("f", "ser"),
+  no.space = TRUE,
+  digits = 4
+)
+
+```
+# Card Only Sample Robustness
+```{r}
+
+FinalDatasetFilteredCard <- FinalDataset %>% filter(card_recall==1)
+
+first_stageCARD <- lm(
+  tri_cumulative ~ avg_north_share_cumulative:factor(region) +
+                   avg_east_share_cumulative:factor(region) +    avg_south_share_cumulative:factor(region) + 
+                   avg_temperature_cumulative  + avg_wind_speed_cumulative +religion+minoritycastetribe+cooking+female+urban+bmi+wealth_index+anemia + factor(region):factor(MOB) + factor(YOB)+bord+age_birth,
+  data = FinalDatasetFilteredCard
+)
+
+
+FinalDatasetFilteredCard$tri_cumulative_hatCARD <- predict(first_stageCARD)
+
+second_stageCARD <- lm(
+    brthwt ~ tri_cumulative_hatCARD + avg_temperature_cumulative + avg_wind_speed_cumulative +minoritycastetribe+religion+cooking+female+urban+bmi+wealth_index+anemia + factor(region):factor(MOB) + factor(YOB) + bord +age_birth ,
+  data = FinalDatasetFilteredCard
+)
+
+cluster_seCARD <- vcovCL(second_stageCARD, cluster = ~district_matched, type='HC1')
+
+
+summary_clusteredCARD <- coeftest(second_stageCARD, vcov. = cluster_seCARD)
+
+
+second_stageCARDLBW <- lm(
+    LBW ~ tri_cumulative_hatCARD + avg_temperature_cumulative +  avg_wind_speed_cumulative +minoritycastetribe+religion+cooking+female+urban+bmi+wealth_index+anemia + factor(region):factor(MOB) + factor(YOB) + bord +age_birth ,
+  data = FinalDatasetFilteredCard
+)
+
+
+cluster_seCARDLBW <- vcovCL(second_stageCARDLBW, cluster = ~district_matched, type='HC1')
+
+
+summary_clusteredCARDLBW <- coeftest(second_stageCARDLBW, vcov. = cluster_seCARDLBW)
+
+
+
+second_stageCARDVLBW <- lm(
+    VLBW ~ tri_cumulative_hatCARD + avg_temperature_cumulative +  avg_wind_speed_cumulative +minoritycastetribe+religion+cooking+female+urban+bmi+wealth_index+anemia + factor(region):factor(MOB) + factor(YOB) + bord +age_birth ,
+  data = FinalDatasetFilteredCard
+)
+
+cluster_seCARDVLBW <- vcovCL(second_stageCARDVLBW, cluster = ~district_matched, type='HC1')
+
+
+summary_clusteredCARDVLBW <- coeftest(second_stageCARDVLBW, vcov. = cluster_seCARDVLBW)
+
+
+instr_varsCARD <- grep("avg_north_share_cumulative|avg_east_share_cumulative|avg_south_share_cumulative", 
+                   names(coef(first_stageCARD)), value = TRUE)
+
+
+
+
+vcov_clusteredCARD <- vcovCL(first_stageCARD, cluster = ~district_matched, type = "HC1")
+
+f_test_clusteredCARD <- linearHypothesis(first_stageCARD, instr_varsCARD, vcov = vcov_clusteredCARD)
+
+
+print(f_test_clusteredCARD)
+
+
+f_stat_clusteredCARD <- f_test_clusteredCARD$F[2]
+print(f_stat_clusteredCARD)
+
+
+
+stargazer(
+  second_stageCARD,second_stageCARDLBW,second_stageCARDVLBW,
+  se = list(sqrt(diag(cluster_seCARD)),sqrt(diag(cluster_seCARDLBW)), sqrt(diag(cluster_seCARDVLBW))),
+  type = "text", omit='factor',
+  title = "IV estimates: Card Only Sample", keep = c('tri_cumulative_hatCARD'),
+  digits = 4
+)
+
+
+mean(FinalDatasetFilteredCard$LBW)
+
+mean(FinalDatasetFilteredCard$brthwt)
+
+mean(FinalDatasetFilteredCard$VLBW)
+```
+
+# Alternative Clustering of SEs
+
+```{r}
+cluster_sestate <- vcovCL(second_stage, cluster = ~state_matched)
+summary_clusteredstate <- coeftest(second_stage, vcov. = cluster_sestate)
+
+cluster_seregion <- vcovCL(second_stage, cluster = ~region)
+summary_clusteredregion <- coeftest(second_stage, vcov. = cluster_seregion)
+
+cluster_sestateLBW <- vcovCL(LBWbaselineIV, cluster = ~state_matched)
+summary_clusteredstateLBW <- coeftest(LBWbaselineIV, vcov. = cluster_sestateLBW)
+
+cluster_seregionLBW <- vcovCL(LBWbaselineIV, cluster = ~region)
+summary_clusteredregionLBW<- coeftest(LBWbaselineIV, vcov. = cluster_seregionLBW)
+
+cluster_sestateVLBW <- vcovCL(VLBWbaselineIV, cluster = ~state_matched)
+summary_clusteredstateVLBW <- coeftest(VLBWbaselineIV, vcov. = cluster_sestateVLBW)
+
+cluster_seregionVLBW<- vcovCL(VLBWbaselineIV, cluster = ~region)
+summary_clusteredregionVLBW <- coeftest(VLBWbaselineIV, vcov. = cluster_seregionVLBW)
+
+
+```
+
+```{r}
+
+# Function to extract only tri_cumulative_hat coefficient
+extract_tri_hat <- function(summary_model, model_name) {
+  tidy_model <- tidy(summary_model)  # Convert to dataframe
+  tri_row <- tidy_model %>% filter(term == "tri_cumulative_hat")  # Select only tri_cumulative_hat
+  data.frame(
+    Model = model_name,
+    Estimate = tri_row$estimate,
+    SE = tri_row$std.error
+  )
+}
+
+coef_data <- bind_rows(
+  extract_tri_hat(summary_clustered, "District"),
+  extract_tri_hat(summary_clusteredstate, "State"),
+  extract_tri_hat(summary_clusteredregion, "Region")
+)
+
+
+#baseline BW clustering district, region and state
+plot_bw <- ggplot(coef_data, aes(x = Model, y = Estimate, color = Model)) +
+  geom_point(size = 4) +  # Coefficients as points
+  geom_errorbar(aes(ymin = Estimate - 1.96 * SE, ymax = Estimate + 1.96 * SE), width = 0.2, size = 1.3) +  # 95% CI
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red", size = 1.5) +  # Reference Line at 0
+  labs(
+    title = "Birth Weight : Coefficient Estimates Baseline with Alternative Clustering of SE's",
+    x = "SE Clustering Choice",
+    y = "Coefficient Estimate",
+    color = "level of clustering"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+plot_bw
+
+#LBW
+coef_data_lbw <- bind_rows(
+  extract_tri_hat(summary_clustered1, "District"),
+  extract_tri_hat(summary_clusteredstateLBW, "State"),
+  extract_tri_hat(summary_clusteredregionLBW, "Region")
+)
+
+
+plot_lbw <- ggplot(coef_data_lbw, aes(x = Model, y = Estimate, color = Model)) +
+  geom_point(size = 4) +
+  geom_errorbar(aes(ymin = Estimate - 1.96 * SE, ymax = Estimate + 1.96 * SE), width = 0.2, size = 1.3) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red", size = 1.5) +
+  labs(
+    title = "LBW : Coefficient Estimates Baseline with Alternative Clustering of SE's",
+    x = "SE Clustering Level",
+    y = "Coefficient Estimate",
+    color = "level of clustering"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+# Show the plot LBW
+plot_lbw
+
+
+
+# VLBW
+coef_data_vlbw <- bind_rows(
+  extract_tri_hat(summary_clustered2, "District"),
+  extract_tri_hat(summary_clusteredstateVLBW, "State"),
+  extract_tri_hat(summary_clusteredregionVLBW, "Region")
+)
+
+# Plotting
+plot_vlbw <- ggplot(coef_data_vlbw, aes(x = Model, y = Estimate, color = Model)) +
+  geom_point(size = 4) +
+  geom_errorbar(aes(ymin = Estimate - 1.96 * SE, ymax = Estimate + 1.96 * SE), width = 0.2, size = 1.3) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red", size = 1.5) +
+  labs(
+    title = "VLBW : Coefficient Estimates Baseline with Alternative Clustering of SE's",
+    x = "SE Clustering Level",
+    y = "Coefficient Estimate",
+    color = "level of clustering"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+plot_vlbw
+
+```
+#Iterative Robustness dropping states/UTs one by one
+```{r}
+results_list_iterBW <- list()
+
+for (state_id in 1:36) {
+  cat("Dropping state:", state_id, "\n")
+  
+  # Subset the data excluding one state
+  temp_data_iterBW <- FinalDataset %>% filter(state_matched != state_id)
+
+  # First-stage regression
+  first_stage_iterBW <- lm(
+    tri_cumulative ~ avg_north_share_cumulative:factor(region) +
+                     avg_east_share_cumulative:factor(region) +
+                     avg_south_share_cumulative:factor(region) +
+                     avg_temperature_cumulative + avg_wind_speed_cumulative +
+                     religion + minoritycastetribe + cooking + female + urban +
+                     bmi + wealth_index + anemia +
+                     factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+    data = temp_data_iterBW
+  )
+
+  # Identify instrument terms
+  instr_vars_iterBW <- grep("avg_(north|east|south)_share_cumulative", names(coef(first_stage_iterBW)), value = TRUE)
+  
+  # Wald F-test for instruments
+  f_test_iterBW <- linearHypothesis(first_stage_iterBW, instr_vars_iterBW, vcov = vcovHC(first_stage_iterBW, type = "HC0"))
+  f_stat_iterBW <- f_test_iterBW$F[2]
+
+  # Predicted values for 2SLS
+  temp_data_iterBW$tri_cumulative_hat <- predict(first_stage_iterBW, newdata = temp_data_iterBW)
+
+  # Second-stage regression
+  second_stage_iterBW <- lm(
+    brthwt ~ tri_cumulative_hat + avg_temperature_cumulative +
+    avg_wind_speed_cumulative + minoritycastetribe + religion + cooking +
+    female + urban + bmi + wealth_index + anemia +
+    factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+    data = temp_data_iterBW
+  )
+
+  # Clustered SE at district level
+  cluster_se_iterBW <- vcovCL(second_stage_iterBW, cluster = ~code, type = 'HC1')
+  clustered_summary_iterBW <- coeftest(second_stage_iterBW, vcov. = cluster_se_iterBW)
+
+  # Save output to list
+  results_list_iterBW[[paste0("drop_state_", state_id)]] <- list(
+    f_stat = f_stat_iterBW,
+    coef = clustered_summary_iterBW
+  )
+}
+
+# Example output display
+print(results_list_iterBW[["drop_state_2"]])
+
+
+# Extract values from results_list_iterBW
+states_iterBW <- 1:36
+tri_coefs_iterBW <- sapply(results_list_iterBW, function(x) x$coef["tri_cumulative_hat", 1])
+tri_se_iterBW    <- sapply(results_list_iterBW, function(x) x$coef["tri_cumulative_hat", 2])
+
+# Calculate 95% confidence intervals
+tri_ci_lower_iterBW <- tri_coefs_iterBW - 1.96 * tri_se_iterBW
+tri_ci_upper_iterBW <- tri_coefs_iterBW + 1.96 * tri_se_iterBW
+
+# Create dataframe
+df_coef_iterBW <- data.frame(
+  State = factor(states_iterBW, levels = states_iterBW),
+  Coef = tri_coefs_iterBW,
+  Lower = tri_ci_lower_iterBW,
+  Upper = tri_ci_upper_iterBW
+)
+
+# Assign a unique color per state
+df_coef_iterBW$ColorGroup <- as.factor(df_coef_iterBW$State)
+
+# Use ggplot with flipped coordinates and add horizontal line at y = 0
+ggplot(df_coef_iterBW, aes(y = Coef, x = State, color = ColorGroup)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = Lower, ymax = Upper), width = 0.3, size = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +  # Horizontal line at 0
+  scale_color_viridis_d(option = "inferno") +
+  labs(
+    #title = "Impact of PM2.5 on Birth Weight (with 95% CI)",
+    #subtitle = "Iteratively Dropping One State/UT at a Time",
+    x = "Dropped State/UT Code (From DHS Records)",
+    y = "Coefficient"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    axis.text.y = element_text(size = 12),
+    panel.grid.major.x = element_blank()
+  )
+
+
+```
+#LBW Iterative dropping
+```{r}
+results_list_iterLBW <- list()
+
+for (state_id in 1:36) {
+  cat("Dropping state:", state_id, "\n")
+  
+
+  temp_data_iterLBW <- FinalDataset %>% filter(state_matched != state_id)
+
+
+  first_stage_iterLBW <- lm(
+    tri_cumulative ~ avg_north_share_cumulative:factor(region) +
+                     avg_east_share_cumulative:factor(region) +
+                     avg_south_share_cumulative:factor(region) +
+                     avg_temperature_cumulative + avg_wind_speed_cumulative +
+                     religion + minoritycastetribe + cooking + female + urban +
+                     bmi + wealth_index + anemia +
+                     factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+    data = temp_data_iterLBW
+  )
+
+
+  instr_vars_iterLBW <- grep("avg_(north|east|south)_share_cumulative", names(coef(first_stage_iterLBW)), value = TRUE)
+  
+ 
+  f_test_iterLBW <- linearHypothesis(first_stage_iterLBW, instr_vars_iterLBW, vcov = vcovHC(first_stage_iterLBW, type = "HC0"))
+  f_stat_iterLBW <- f_test_iterLBW$F[2]
+
+  temp_data_iterLBW$tri_cumulative_hat <- predict(first_stage_iterLBW, newdata = temp_data_iterLBW)
+
+ 
+  second_stage_iterLBW <- lm(
+    LBW ~ tri_cumulative_hat + avg_temperature_cumulative +
+    avg_wind_speed_cumulative + minoritycastetribe + religion + cooking +
+    female + urban + bmi + wealth_index + anemia +
+    factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+    data = temp_data_iterLBW
+  )
+
+
+  cluster_se_iterLBW <- vcovCL(second_stage_iterLBW, cluster = ~code, type = 'HC1')
+  clustered_summary_iterLBW <- coeftest(second_stage_iterLBW, vcov. = cluster_se_iterLBW)
+
+
+  results_list_iterLBW[[paste0("drop_state_", state_id)]] <- list(
+    f_stat = f_stat_iterLBW,
+    coef = clustered_summary_iterLBW
+  )
+}
+
+
+
+
+
+states_iterLBW <- 1:36
+tri_coefs_iterLBW <- sapply(results_list_iterLBW, function(x) x$coef["tri_cumulative_hat", 1])
+tri_se_iterLBW    <- sapply(results_list_iterLBW, function(x) x$coef["tri_cumulative_hat", 2])
+
+tri_ci_lower_iterLBW <- tri_coefs_iterLBW - 1.96 * tri_se_iterLBW
+tri_ci_upper_iterLBW <- tri_coefs_iterLBW + 1.96 * tri_se_iterLBW
+
+
+df_coef_iterLBW <- data.frame(
+  State = factor(states_iterLBW, levels = states_iterLBW),
+  Coef = tri_coefs_iterLBW,
+  Lower = tri_ci_lower_iterLBW,
+  Upper = tri_ci_upper_iterLBW
+)
+
+
+df_coef_iterLBW$ColorGroup <- as.factor(df_coef_iterLBW$State)
+
+
+ggplot(df_coef_iterLBW, aes(y = Coef, x = State, color = ColorGroup)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = Lower, ymax = Upper), width = 0.3, size = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +  # Horizontal line at 0
+  scale_color_viridis_d(option = "inferno") +
+  labs(
+    #title = "Impact of PM2.5 on Birth Weight (with 95% CI)",
+    #subtitle = "Iteratively Dropping One State/UT at a Time",
+    x = "Dropped State/UT Code (From DHS Records)",
+    y = "Coefficient"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    axis.text.y = element_text(size = 12),
+    panel.grid.major.x = element_blank()
+  )
+
+
+```
+
+#Above Average Size Robustness Check
+```{r}
+
+second_stageabove <- lm(
+   above_averagesize  ~ tri_cumulative_hat + avg_temperature_cumulative  + avg_wind_speed_cumulative +minoritycastetribe+religion+cooking+female+urban+bmi+wealth_index+anemia + factor(region):factor(MOB) + factor(YOB) + bord + age_birth ,
+  data = FinalDataset
+)
+
+cluster_se_size <- vcovCL(second_stageabove, cluster = ~district_matched, type='HC1' )
+sesize <- list(sqrt(diag(cluster_se_size)))
+
+
+
+meanbelow <- mean(FinalDataset$below_averagesize,na.rm=TRUE)
+meanabove <- 1-meanbelow
+
+stargazer(second_stageabove, type='text',  se=sesize, omit='factor',keep=c('tri_cumulative_hat'), add.lines = list(c('Mean of Dependent Variable', meanabove), c('First stage F-statistic', f_stat_clustered)),digits=4)
+```
+```{r}
+FinalDataset <- FinalDataset %>%
+  mutate(
+    #Trimester 3
+    northsharetri3 = (North_share1 + North_share2 + North_share3) / 3,
+    southsharetri3 = (South_share1 + South_share2 + South_share3) / 3,
+    eastsharetri3  = (East_share1 + East_share2 + East_share3) / 3,
+    windtri3       = (avg_wind_speed1 + avg_wind_speed2 + avg_wind_speed3) / 3,
+    temptri3       = (avg_temperature1 + avg_temperature2 + avg_temperature3) / 3,
+    pmtri3         = (pm1 + pm2 + pm3) / 3,
+    
+    
+    
+    # Trimester 2
+    northsharetri2 = (North_share4 + North_share5 + North_share6) / 3,
+    southsharetri2 = (South_share4 + South_share5 + South_share6) / 3,
+    eastsharetri2  = (East_share4 + East_share5 + East_share6) / 3,
+    windtri2       = (avg_wind_speed4 + avg_wind_speed5 + avg_wind_speed6) / 3,
+    temptri2       = (avg_temperature4 + avg_temperature5 + avg_temperature6) / 3,
+    pmtri2         = (pm4 + pm5 + pm6) / 3,
+
+    # Trimester 1
+    northsharetri1 = (North_share7 + North_share8 + North_share9) / 3,
+    southsharetri1 = (South_share7 + South_share8 + South_share9) / 3,
+    eastsharetri1  = (East_share7 + East_share8 + East_share9) / 3,
+    windtri1       = (avg_wind_speed7 + avg_wind_speed8 + avg_wind_speed9) / 3,
+    temptri1       = (avg_temperature7 + avg_temperature8 + avg_temperature9) / 3,
+    pmtri1         = (pm7 + pm8 + pm9) / 3
+  )
+
+#TRIMESTER 3
+first_stagetri3 <- lm(
+  pmtri3 ~ northsharetri3:factor(region) + eastsharetri3:factor(region) + southsharetri3:factor(region) +
+    temptri3 + windtri3 + religion + minoritycastetribe + cooking + female + urban +
+    bmi + wealth_index + anemia + factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+  data = FinalDataset
+)
+
+FinalDataset$tri_hat3 <- predict(first_stagetri3)
+instr_varstri3 <- grep("northsharetri3|eastsharetri3|southsharetri3", names(coef(first_stagetri3)), value = TRUE)
+vcov_clusteredtri3 <- vcovCL(first_stagetri3, cluster = ~code, type = "HC1")
+f_test_clusteredtri3 <- linearHypothesis(first_stagetri3, instr_varstri3, vcov = vcov_clusteredtri3)
+f_stat_clusteredtri3 <- f_test_clusteredtri3$F[2]
+print(f_stat_clusteredtri3)
+
+second_stagetri3BW <- lm(
+  brthwt ~ tri_hat3 + temptri3 + windtri3 + minoritycastetribe + religion + cooking + female + urban +
+    bmi + wealth_index + anemia + factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+  data = FinalDataset
+)
+
+second_stagetri3LBW <- lm(
+  LBW ~ tri_hat3 + temptri3 + windtri3 + minoritycastetribe + religion + cooking + female + urban +
+    bmi + wealth_index + anemia + factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+  data = FinalDataset
+)
+
+second_stagetri3VLBW <- lm(
+  VLBW ~ tri_hat3 + temptri3 + windtri3 + minoritycastetribe + religion + cooking + female + urban +
+    bmi + wealth_index + anemia + factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+  data = FinalDataset
+)
+
+se_tri3_bw <- sqrt(diag(vcovCL(second_stagetri3BW, cluster = ~code, type = "HC1")))
+se_tri3_lbw <- sqrt(diag(vcovCL(second_stagetri3LBW, cluster = ~code, type = "HC1")))
+se_tri3_vlbw <- sqrt(diag(vcovCL(second_stagetri3VLBW, cluster = ~code, type = "HC1")))
+
+
+
+#TRIMESTER 2 
+first_stagetri2 <- lm(
+  pmtri2 ~ northsharetri2:factor(region) + eastsharetri2:factor(region) + southsharetri2:factor(region) +
+    temptri2 + windtri2 + religion + minoritycastetribe + cooking + female + urban +
+    bmi + wealth_index + anemia + factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+  data = FinalDataset
+)
+
+FinalDataset$tri_hat2 <- predict(first_stagetri2)
+instr_varstri2 <- grep("northsharetri2|eastsharetri2|southsharetri2", names(coef(first_stagetri2)), value = TRUE)
+vcov_clusteredtri2 <- vcovCL(first_stagetri2, cluster = ~code, type = "HC1")
+f_test_clusteredtri2 <- linearHypothesis(first_stagetri2, instr_varstri2, vcov = vcov_clusteredtri2)
+f_stat_clusteredtri2 <- f_test_clusteredtri2$F[2]
+print(f_stat_clusteredtri2)
+
+second_stagetri2BW <- lm(
+  brthwt ~ tri_hat2 + temptri2 + windtri2 + minoritycastetribe + religion + cooking + female + urban +
+    bmi + wealth_index + anemia + factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+  data = FinalDataset
+)
+
+second_stagetri2LBW <- lm(
+  LBW ~ tri_hat2 + temptri2 + windtri2 + minoritycastetribe + religion + cooking + female + urban +
+    bmi + wealth_index + anemia + factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+  data = FinalDataset
+)
+
+second_stagetri2VLBW <- lm(
+  VLBW ~ tri_hat2 + temptri2 + windtri2 + minoritycastetribe + religion + cooking + female + urban +
+    bmi + wealth_index + anemia + factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+  data = FinalDataset
+)
+
+se_tri2_bw <- sqrt(diag(vcovCL(second_stagetri2BW, cluster = ~code, type = "HC1")))
+se_tri2_lbw <- sqrt(diag(vcovCL(second_stagetri2LBW, cluster = ~code, type = "HC1")))
+se_tri2_vlbw <- sqrt(diag(vcovCL(second_stagetri2VLBW, cluster = ~code, type = "HC1")))
+
+# TRIMESTER 1
+first_stagetri1 <- lm(
+  pmtri1 ~ northsharetri1:factor(region) + eastsharetri1:factor(region) + southsharetri1:factor(region) +
+    temptri1 + windtri1 + religion + minoritycastetribe + cooking + female + urban +
+    bmi + wealth_index + anemia + factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+  data = FinalDataset
+)
+
+FinalDataset$tri_hat1 <- predict(first_stagetri1)
+instr_varstri1 <- grep("northsharetri1|eastsharetri1|southsharetri1", names(coef(first_stagetri1)), value = TRUE)
+vcov_clusteredtri1 <- vcovCL(first_stagetri1, cluster = ~code, type = "HC1")
+f_test_clusteredtri1 <- linearHypothesis(first_stagetri1, instr_varstri1, vcov = vcov_clusteredtri1)
+f_stat_clusteredtri1 <- f_test_clusteredtri1$F[2]
+print(f_stat_clusteredtri1)
+
+second_stagetri1BW <- lm(
+  brthwt ~ tri_hat1 + temptri1 + windtri1 + minoritycastetribe + religion + cooking + female + urban +
+    bmi + wealth_index + anemia + factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+  data = FinalDataset
+)
+
+second_stagetri1LBW <- lm(
+  LBW ~ tri_hat1 + temptri1 + windtri1 + minoritycastetribe + religion + cooking + female + urban +
+    bmi + wealth_index + anemia + factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+  data = FinalDataset
+)
+
+second_stagetri1VLBW <- lm(
+  VLBW ~ tri_hat1 + temptri1 + windtri1 + minoritycastetribe + religion + cooking + female + urban +
+    bmi + wealth_index + anemia + factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+  data = FinalDataset
+)
+
+se_tri1_bw <- sqrt(diag(vcovCL(second_stagetri1BW, cluster = ~code, type = "HC1")))
+se_tri1_lbw <- sqrt(diag(vcovCL(second_stagetri1LBW, cluster = ~code, type = "HC1")))
+se_tri1_vlbw <- sqrt(diag(vcovCL(second_stagetri1VLBW, cluster = ~code, type = "HC1")))
+
+
+# Trimester 3 table
+stargazer(
+  second_stagetri3BW, second_stagetri3LBW, second_stagetri3VLBW,
+  type = "text",
+  se = list(se_tri3_bw, se_tri3_lbw, se_tri3_vlbw), digits=5,
+  keep = c('tri_hat3'))
+
+
+# Trimester 2 table
+stargazer(
+  second_stagetri2BW, second_stagetri2LBW, second_stagetri2VLBW,
+  type = "text", digits=5,
+  se = list(se_tri2_bw, se_tri2_lbw, se_tri2_vlbw),
+  keep = c('tri_hat2'))
+
+# Trimester 1 table
+stargazer(
+  second_stagetri1BW, second_stagetri1LBW, second_stagetri1VLBW,
+  type = "text", digits=5,
+  se = list(se_tri1_bw, se_tri1_lbw, se_tri1_vlbw),
+  keep = c('tri_hat1'),
+  omit.stat = c("f", "ser")
+)
+
+```
+#Outliers Filtered (bw 1st and 99th percentile)
+```{r}
+
+brthwt_bounds <- quantile(FinalDataset$brthwt, probs = c(0.01, 0.99), na.rm = TRUE)
+
+
+FinalDatasetFilteredOUTLIERS <- FinalDataset %>%
+  filter(brthwt > brthwt_bounds[1], brthwt < brthwt_bounds[2])
+
+
+first_stageOUTLIERS <- lm(
+  tri_cumulative ~ avg_north_share_cumulative:factor(region) +
+                   avg_east_share_cumulative:factor(region) +    avg_south_share_cumulative:factor(region) + 
+                   avg_temperature_cumulative + avg_wind_speed_cumulative +religion+minoritycastetribe+cooking+female+urban+bmi+wealth_index+anemia + factor(region):factor(MOB) + factor(YOB)+bord+age_birth,
+  data = FinalDatasetFilteredOUTLIERS
+)
+
+
+
+
+FinalDatasetFilteredOUTLIERS$tri_cumulative_hatOUTLIERS <- predict(first_stageOUTLIERS)
+
+second_stageOUTLIERS <- lm(
+    brthwt ~ tri_cumulative_hatOUTLIERS + avg_temperature_cumulative+ avg_wind_speed_cumulative +minoritycastetribe+religion+cooking+female+urban+bmi+wealth_index+anemia + factor(region):factor(MOB) + factor(YOB) + bord +age_birth ,
+  data = FinalDatasetFilteredOUTLIERS
+)
+
+cluster_seOUTLIERS <- vcovCL(second_stageOUTLIERS, cluster = ~code, type='HC1')
+
+summary_clusteredOUTLIERS <- coeftest(second_stageOUTLIERS, vcov. = cluster_seOUTLIERS)
+
+
+second_stageOUTLIERSLBW <- lm(
+    LBW ~ tri_cumulative_hatOUTLIERS + avg_temperature_cumulative  + avg_wind_speed_cumulative +minoritycastetribe+religion+cooking+female+urban+bmi+wealth_index+anemia + factor(region):factor(MOB) + factor(YOB) + bord +age_birth ,
+  data = FinalDatasetFilteredOUTLIERS
+)
+
+
+cluster_seOUTLIERSLBW <- vcovCL(second_stageOUTLIERSLBW, cluster = ~code, type='HC1')
+
+
+summary_clusteredOUTLIERSLBW <- coeftest(second_stageOUTLIERSLBW, vcov. = cluster_seOUTLIERSLBW)
+
+
+stargazer(
+  second_stageOUTLIERS,second_stageOUTLIERSLBW,
+  se = list(sqrt(diag(cluster_seOUTLIERS)),sqrt(diag(cluster_seOUTLIERSLBW))),
+  type = "text", omit='factor',
+  title = "Outliers Filtered: BW between 1st and 99th percentile", keep = c('tri_cumulative_hatOUTLIERS','avg_temperature_cumulative'),
+  digits = 4
+)
+
+instr_varsOUTLIERS <- grep("avg_north_share_cumulative|avg_east_share_cumulative|avg_south_share_cumulative", 
+                   names(coef(first_stageOUTLIERS)), value = TRUE)
+
+
+
+
+
+vcov_clusteredOUTLIERS <- vcovCL(first_stageOUTLIERS, cluster = ~code, type = "HC1")
+
+
+f_test_clusteredOUTLIERS <- linearHypothesis(first_stageOUTLIERS, instr_varsOUTLIERS, vcov = vcov_clusteredOUTLIERS)
+
+
+print(f_test_clusteredOUTLIERS)
+
+
+f_stat_clusteredOUTLIERS <- f_test_clusteredOUTLIERS$F[2]
+print(f_stat_clusteredOUTLIERS)
+
+mean(FinalDatasetFilteredOUTLIERS$LBW)
+
+mean(FinalDatasetFilteredOUTLIERS$brthwt)
+```
+
+#Outliers bewteen 2.5th and 97.5th percentile or between 1600 and 4000 grams (same)
+```{r}
+
+brthwt_bounds <- quantile(FinalDataset$brthwt, probs = c(0.025, 0.975), na.rm = TRUE)
+
+
+FinalDatasetFilteredOUTLIERS1 <- FinalDataset %>%
+  filter(brthwt > brthwt_bounds[1], brthwt < brthwt_bounds[2])
+
+
+first_stageOUTLIERS1 <- lm(
+  tri_cumulative ~ avg_north_share_cumulative:factor(region) +
+                   avg_east_share_cumulative:factor(region) +    avg_south_share_cumulative:factor(region) + 
+                   avg_temperature_cumulative + avg_wind_speed_cumulative +religion+minoritycastetribe+cooking+female+urban+bmi+wealth_index+anemia + factor(region):factor(MOB) + factor(YOB)+bord+age_birth,
+  data = FinalDatasetFilteredOUTLIERS1
+)
+
+
+
+
+FinalDatasetFilteredOUTLIERS1$tri_cumulative_hatOUTLIERS1 <- predict(first_stageOUTLIERS1)
+
+second_stageOUTLIERS1 <- lm(
+    brthwt ~ tri_cumulative_hatOUTLIERS1 + avg_temperature_cumulative+ avg_wind_speed_cumulative +minoritycastetribe+religion+cooking+female+urban+bmi+wealth_index+anemia + factor(region):factor(MOB) + factor(YOB) + bord +age_birth ,
+  data = FinalDatasetFilteredOUTLIERS1
+)
+
+
+cluster_seOUTLIERS1 <- vcovCL(second_stageOUTLIERS1, cluster = ~code, type='HC1')
+
+
+summary_clusteredOUTLIERS1 <- coeftest(second_stageOUTLIERS1, vcov. = cluster_seOUTLIERS1)
+
+
+second_stageOUTLIERSLBW1 <- lm(
+    LBW ~ tri_cumulative_hatOUTLIERS1 + avg_temperature_cumulative  + avg_wind_speed_cumulative +minoritycastetribe+religion+cooking+female+urban+bmi+wealth_index+anemia + factor(region):factor(MOB) + factor(YOB) + bord +age_birth ,
+  data = FinalDatasetFilteredOUTLIERS1
+)
+
+
+cluster_seOUTLIERSLBW1 <- vcovCL(second_stageOUTLIERSLBW1, cluster = ~code, type='HC1')
+
+
+summary_clusteredOUTLIERSLBW1 <- coeftest(second_stageOUTLIERSLBW1, vcov. = cluster_seOUTLIERSLBW1)
+
+
+
+stargazer(
+  second_stageOUTLIERS1,second_stageOUTLIERSLBW1,
+  se = list(sqrt(diag(cluster_seOUTLIERS1)),sqrt(diag(cluster_seOUTLIERSLBW1))),
+  type = "text", omit='factor',
+  title = "Outliers Filtered: BW between 2.5th and 97.5th percentile", keep = c('tri_cumulative_hatOUTLIERS1'),
+  digits = 4)
+
+
+instr_varsOUTLIERS1 <- grep("avg_north_share_cumulative|avg_east_share_cumulative|avg_south_share_cumulative", 
+                   names(coef(first_stageOUTLIERS1)), value = TRUE)
+
+
+
+
+
+vcov_clusteredOUTLIERS1 <- vcovCL(first_stageOUTLIERS1, cluster = ~code, type = "HC1")
+
+
+f_test_clusteredOUTLIERS1 <- linearHypothesis(first_stageOUTLIERS1, instr_varsOUTLIERS1, vcov = vcov_clusteredOUTLIERS1)
+
+print(f_test_clusteredOUTLIERS1)
+
+
+f_stat_clusteredOUTLIERS1 <- f_test_clusteredOUTLIERS1$F[2]
+print(f_stat_clusteredOUTLIERS1)
+
+
+mean(FinalDatasetFilteredOUTLIERS1$LBW)
+
+mean(FinalDatasetFilteredOUTLIERS1$brthwt)
+
+```
+
+
+# Robustness using Van Donkelaar Data
+```{r}
+FinalDatasetVanDonk <- FinalDataset %>% filter(!is.na(pmvandonk_cumulative))
+
+first_stageVanDonk <- lm(
+  pmvandonk_cumulative ~ North_share_cumulative:factor(region) +
+                   East_share_cumulative:factor(region)  +   South_share_cumulative:factor(region)  + 
+                   temp_cumulative  + windspeed_cumulative + factor(religion_code) + dirty_cookingfuel+sex_child+urban+bmi+factor(wealth_index) + factor(anemic) + factor(region):factor(month_birth) + factor(year_birth) + birthorder + age_birth+ factor(caste),
+  data = FinalDatasetVanDonk
+)
+
+summary(first_stageVanDonk)
+
+
+FinalDatasetVanDonk$tri_cumulative_hat <- predict(first_stageVanDonk)
+
+
+second_stageVanDonkBW <- lm(
+  birthweight ~ tri_cumulative_hat  + 
+                   temp_cumulative  + windspeed_cumulative + factor(religion_code) + dirty_cookingfuel+sex_child+urban+bmi+factor(wealth_index) + factor(anemic) + factor(region):factor(month_birth) + factor(year_birth) + birthorder + age_birth+ factor(caste),
+  data = FinalDatasetVanDonk
+)
+
+cluster_seVanDonkBW <- vcovCL(second_stageVanDonkBW, cluster = ~code, type='HC1')
+
+second_stageVanDonkLBW <- lm(
+  lbw ~ tri_cumulative_hat  + 
+                   temp_cumulative  + windspeed_cumulative + factor(religion_code) + dirty_cookingfuel+sex_child+urban+bmi+factor(wealth_index) + factor(anemic) + factor(region):factor(month_birth) + factor(year_birth) + birthorder + age_birth+ factor(caste),
+  data = FinalDatasetVanDonk
+)
+
+cluster_seVanDonkLBW <- vcovCL(second_stageVanDonkLBW, cluster = ~code, type='HC1')
+
+second_stageVanDonkVLBW <- lm(
+ vlbw ~ tri_cumulative_hat  + 
+                   temp_cumulative  + windspeed_cumulative + factor(religion_code) + dirty_cookingfuel+sex_child+urban+bmi+factor(wealth_index) + factor(anemic) + factor(region):factor(month_birth) + factor(year_birth) + birthorder + age_birth+ factor(caste),
+  data = FinalDatasetVanDonk
+)
+
+
+cluster_seVanDonkVLBW <- vcovCL(second_stageVanDonkVLBW, cluster = ~code, type='HC1')
+
+
+
+stargazer(
+  second_stageVanDonkBW, second_stageVanDonkLBW, second_stageVanDonkVLBW,
+  se = list(sqrt(diag(cluster_seVanDonkBW)),sqrt(diag(cluster_seVanDonkLBW)),sqrt(diag(cluster_seVanDonkVLBW))),digits=4,
+  type = "text", omit='factor',
+  title = "Second-Stage Regression with Clustered SE at District Level"
+)
+
+
+instr_varsVanDonk <- grep("North_share_cumulative|East_share_cumulative|South_share_cumulative", 
+                   names(coef(first_stageVanDonk)), value = TRUE)
+
+vcov_clusteredVanDonk <- vcovCL(first_stageVanDonk, cluster = ~code, type = "HC1")
+
+f_test_clusteredVanDonk <- linearHypothesis(first_stageVanDonk, instr_varsVanDonk, vcov = vcov_clusteredVanDonk)
+
+
+
+f_stat_clusteredVanDonk <- f_test_clusteredVanDonk$F[2]
+print(f_stat_clusteredVanDonk)
+
+
+```
+
+#OLS Using Van Donk Data
+```{r}
+VanDonkBWOLS <- lm(
+  birthweight ~ pmvandonk_cumulative  + 
+                   temp_cumulative  + windspeed_cumulative + factor(religion_code) + dirty_cookingfuel+sex_child+urban+bmi+factor(wealth_index) + factor(anemic) + factor(region):factor(month_birth) + factor(year_birth) + birthorder + age_birth+ factor(caste),
+  data = FinalDatasetVanDonk
+)
+
+cluster_seVanDonkBWOLS <- vcovCL(VanDonkBWOLS, cluster = ~code, type='HC1')
+
+VanDonkLBWOLS <- lm(
+  lbw ~ pmvandonk_cumulative  + 
+                   temp_cumulative  + windspeed_cumulative + factor(religion_code) + dirty_cookingfuel+sex_child+urban+bmi+factor(wealth_index) + factor(anemic) + factor(region):factor(month_birth) + factor(year_birth) + birthorder + age_birth+ factor(caste),
+  data = FinalDatasetVanDonk
+)
+
+cluster_seVanDonkLBWOLS <- vcovCL(VanDonkLBWOLS, cluster = ~code, type='HC1')
+
+VanDonkVLBWOLS <- lm(
+ vlbw ~ pmvandonk_cumulative  + 
+                   temp_cumulative  + windspeed_cumulative + factor(religion_code) + dirty_cookingfuel+sex_child+urban+bmi+factor(wealth_index) + factor(anemic) + factor(region):factor(month_birth) + factor(year_birth) + birthorder + age_birth+ factor(caste),
+  data = FinalDatasetVanDonk
+)
+
+
+cluster_seVanDonkVLBWOLS <- vcovCL(VanDonkVLBWOLS, cluster = ~code, type='HC1')
+
+
+
+stargazer(
+  VanDonkBWOLS, VanDonkLBWOLS, VanDonkVLBWOLS,
+  se = list(sqrt(diag(cluster_seVanDonkBWOLS)),sqrt(diag(cluster_seVanDonkLBWOLS)),sqrt(diag(cluster_seVanDonkVLBWOLS))),digits=5,
+  type = "text", omit='factor',
+  title = "Second-Stage Regression with Clustered SE at District Level"
+)
+```
+
+
+
+#Robustness excluding MOB, MOB+1 AND MOB+2 And re-estimating
+```{r}
+
+
+FinalDataset <- FinalDataset %>%
+  mutate(
+    northsharepreg_exMOB = (North_share1 + North_share2 + North_share3 + North_share4 + 
+                            North_share5 + North_share6 + North_share7 + North_share8 + North_share9) / 9,
+    
+    southsharepreg_exMOB = (South_share1 + South_share2 + South_share3 + South_share4 + 
+                            South_share5 + South_share6 + South_share7 + South_share8 + South_share9) / 9,
+    
+    eastsharepreg_exMOB  = (East_share1 + East_share2 + East_share3 + East_share4 + 
+                            East_share5 + East_share6 + East_share7 + East_share8 + East_share9) / 9,
+    
+    windpreg_exMOB = (avg_wind_speed1 + avg_wind_speed2 + avg_wind_speed3 + avg_wind_speed4 + 
+                      avg_wind_speed5 + avg_wind_speed6 + avg_wind_speed7 + avg_wind_speed8 + avg_wind_speed9) / 9,
+    
+    temppreg_exMOB = (avg_temperature1 + avg_temperature2 + avg_temperature3 + avg_temperature4 + 
+                      avg_temperature5 + avg_temperature6 + avg_temperature7 + avg_temperature8 + avg_temperature9) / 9,
+    
+    pmpreg_exMOB = (pm1 + pm2 + pm3 + pm4 + pm5 + pm6 + pm7 + pm8 + pm9) / 9
+  )
+
+
+first_stage_preg_exMOB <- lm(
+  pmpreg_exMOB ~ northsharepreg_exMOB:factor(region) +
+    eastsharepreg_exMOB:factor(region) +
+    southsharepreg_exMOB:factor(region) +
+    temppreg_exMOB + windpreg_exMOB +
+    religion + minoritycastetribe + cooking + female + urban +
+    bmi + wealth_index + anemia +
+    factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+  data = FinalDataset
+)
+
+
+FinalDataset$preg_hat_exMOB <- predict(first_stage_preg_exMOB)
+
+
+instr_vars_preg <- grep("northsharepreg_exMOB|eastsharepreg_exMOB|southsharepreg_exMOB", 
+                        names(coef(first_stage_preg_exMOB)), value = TRUE)
+
+vcov_clustered_preg <- vcovCL(first_stage_preg_exMOB, cluster = ~district_matched, type = "HC1")
+f_test_clustered_preg <- linearHypothesis(first_stage_preg_exMOB, instr_vars_preg, vcov = vcov_clustered_preg)
+f_stat_clustered_preg <- f_test_clustered_preg$F[2]
+print(f_test_clustered_preg)
+print(paste("Clustered first-stage F-statistic:", round(f_stat_clustered_preg, 2)))
+
+second_stage_bw <- lm(
+  brthwt ~ preg_hat_exMOB + temppreg_exMOB + windpreg_exMOB +
+    minoritycastetribe + religion + cooking + female + urban +
+    bmi + wealth_index + anemia +
+    factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+  data = FinalDataset
+)
+
+second_stage_lbw <- lm(
+  LBW ~ preg_hat_exMOB + temppreg_exMOB + windpreg_exMOB +
+    minoritycastetribe + religion + cooking + female + urban +
+    bmi + wealth_index + anemia +
+    factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+  data = FinalDataset
+)
+
+second_stage_vlbw <- lm(
+  VLBW ~ preg_hat_exMOB + temppreg_exMOB + windpreg_exMOB +
+    minoritycastetribe + religion + cooking + female + urban +
+    bmi + wealth_index + anemia +
+    factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+  data = FinalDataset
+)
+
+
+se_bw <- sqrt(diag(vcovCL(second_stage_bw, cluster = ~district_matched, type = "HC1")))
+se_lbw <- sqrt(diag(vcovCL(second_stage_lbw, cluster = ~district_matched, type = "HC1")))
+se_vlbw <- sqrt(diag(vcovCL(second_stage_vlbw, cluster = ~district_matched, type = "HC1")))
+
+stargazer(
+  second_stage_bw, second_stage_lbw, second_stage_vlbw,
+  type = "text",
+  se = list(se_bw, se_lbw, se_vlbw), keep='preg_hat_exMOB',digits=5
+)
+
+```
+```{r}
+FinalDataset <- FinalDataset %>%
+  mutate(
+    northsharepreg_exmob_mob1 = (North_share2 + North_share3 + North_share4 + North_share5 + North_share6 + North_share7 + North_share8 + North_share9) / 8,
+    southsharepreg_exmob_mob1 = (South_share2 + South_share3 + South_share4 + South_share5 + South_share6 + South_share7 + South_share8 + South_share9) / 8,
+    eastsharepreg_exmob_mob1  = (East_share2 + East_share3 + East_share4 + East_share5 + East_share6 + East_share7 + East_share8 + East_share9) / 8,
+    windpreg_exmob_mob1       = (avg_wind_speed2 + avg_wind_speed3 + avg_wind_speed4 + avg_wind_speed5 + avg_wind_speed6 + avg_wind_speed7 + avg_wind_speed8 + avg_wind_speed9) / 8,
+    temppreg_exmob_mob1       = (avg_temperature2 + avg_temperature3 + avg_temperature4 + avg_temperature5 + avg_temperature6 + avg_temperature7 + avg_temperature8 + avg_temperature9) / 8,
+    pmpreg_exmob_mob1         = (pm2 + pm3 + pm4 + pm5 + pm6 + pm7 + pm8 + pm9) / 8,
+
+    northsharepreg_exmob_mob1_mob2 = (North_share3 + North_share4 + North_share5 + North_share6 + North_share7 + North_share8 + North_share9) / 7,
+    southsharepreg_exmob_mob1_mob2 = (South_share3 + South_share4 + South_share5 + South_share6 + South_share7 + South_share8 + South_share9) / 7,
+    eastsharepreg_exmob_mob1_mob2  = (East_share3 + East_share4 + East_share5 + East_share6 + East_share7 + East_share8 + East_share9) / 7,
+    windpreg_exmob_mob1_mob2       = (avg_wind_speed3 + avg_wind_speed4 + avg_wind_speed5 + avg_wind_speed6 + avg_wind_speed7 + avg_wind_speed8 + avg_wind_speed9) / 7,
+    temppreg_exmob_mob1_mob2       = (avg_temperature3 + avg_temperature4 + avg_temperature5 + avg_temperature6 + avg_temperature7 + avg_temperature8 + avg_temperature9) / 7,
+    pmpreg_exmob_mob1_mob2         = (pm3 + pm4 + pm5 + pm6 + pm7 + pm8 + pm9) / 7
+  )
+
+first_stage_exmob_mob1 <- lm(
+  pmpreg_exmob_mob1 ~ northsharepreg_exmob_mob1:factor(region) +
+    eastsharepreg_exmob_mob1:factor(region) +
+    southsharepreg_exmob_mob1:factor(region) +
+    temppreg_exmob_mob1 + windpreg_exmob_mob1 +
+    religion + minoritycastetribe + cooking + female + urban +
+    bmi + wealth_index + anemia +
+    factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+  data = FinalDataset
+)
+
+FinalDataset$preg_hat_exmob_mob1 <- predict(first_stage_exmob_mob1)
+
+instr_vars_exmob_mob1 <- grep("northsharepreg_exmob_mob1|eastsharepreg_exmob_mob1|southsharepreg_exmob_mob1", names(coef(first_stage_exmob_mob1)), value = TRUE)
+vcov_cl_exmob_mob1 <- vcovCL(first_stage_exmob_mob1, cluster = ~district_matched, type = "HC1")
+f_test_exmob_mob1 <- linearHypothesis(first_stage_exmob_mob1, instr_vars_exmob_mob1, vcov = vcov_cl_exmob_mob1)
+f_stat_exmob_mob1 <- f_test_exmob_mob1$F[2]
+
+first_stage_exmob_mob1_mob2 <- lm(
+  pmpreg_exmob_mob1_mob2 ~ northsharepreg_exmob_mob1_mob2:factor(region) +
+    eastsharepreg_exmob_mob1_mob2:factor(region) +
+    southsharepreg_exmob_mob1_mob2:factor(region) +
+    temppreg_exmob_mob1_mob2 + windpreg_exmob_mob1_mob2 +
+    religion + minoritycastetribe + cooking + female + urban +
+    bmi + wealth_index + anemia +
+    factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+  data = FinalDataset
+)
+
+FinalDataset$preg_hat_exmob_mob1_mob2 <- predict(first_stage_exmob_mob1_mob2)
+
+instr_vars_exmob_mob1_mob2 <- grep("northsharepreg_exmob_mob1_mob2|eastsharepreg_exmob_mob1_mob2|southsharepreg_exmob_mob1_mob2", names(coef(first_stage_exmob_mob1_mob2)), value = TRUE)
+vcov_cl_exmob_mob1_mob2 <- vcovCL(first_stage_exmob_mob1_mob2, cluster = ~district_matched, type = "HC1")
+f_test_exmob_mob1_mob2 <- linearHypothesis(first_stage_exmob_mob1_mob2, instr_vars_exmob_mob1_mob2, vcov = vcov_cl_exmob_mob1_mob2)
+f_stat_exmob_mob1_mob2 <- f_test_exmob_mob1_mob2$F[2]
+
+second_bw_exmob_mob1 <- lm(brthwt ~ preg_hat_exmob_mob1 + temppreg_exmob_mob1 + windpreg_exmob_mob1 +
+                              minoritycastetribe + religion + cooking + female + urban + bmi + wealth_index + anemia +
+                              factor(region):factor(MOB) + factor(YOB) + bord + age_birth, data = FinalDataset)
+
+second_lbw_exmob_mob1 <- lm(LBW ~ preg_hat_exmob_mob1 + temppreg_exmob_mob1 + windpreg_exmob_mob1 +
+                               minoritycastetribe + religion + cooking + female + urban + bmi + wealth_index + anemia +
+                               factor(region):factor(MOB) + factor(YOB) + bord + age_birth, data = FinalDataset)
+
+second_vlbw_exmob_mob1 <- lm(VLBW ~ preg_hat_exmob_mob1 + temppreg_exmob_mob1 + windpreg_exmob_mob1 +
+                                minoritycastetribe + religion + cooking + female + urban + bmi + wealth_index + anemia +
+                                factor(region):factor(MOB) + factor(YOB) + bord + age_birth, data = FinalDataset)
+
+second_bw_exmob_mob1_mob2 <- lm(brthwt ~ preg_hat_exmob_mob1_mob2 + temppreg_exmob_mob1_mob2 + windpreg_exmob_mob1_mob2 +
+                                   minoritycastetribe + religion + cooking + female + urban + bmi + wealth_index + anemia +
+                                   factor(region):factor(MOB) + factor(YOB) + bord + age_birth, data = FinalDataset)
+
+second_lbw_exmob_mob1_mob2 <- lm(LBW ~ preg_hat_exmob_mob1_mob2 + temppreg_exmob_mob1_mob2 + windpreg_exmob_mob1_mob2 +
+                                    minoritycastetribe + religion + cooking + female + urban + bmi + wealth_index + anemia +
+                                    factor(region):factor(MOB) + factor(YOB) + bord + age_birth, data = FinalDataset)
+
+second_vlbw_exmob_mob1_mob2 <- lm(VLBW ~ preg_hat_exmob_mob1_mob2 + temppreg_exmob_mob1_mob2 + windpreg_exmob_mob1_mob2 +
+                                     minoritycastetribe + religion + cooking + female + urban + bmi + wealth_index + anemia +
+                                     factor(region):factor(MOB) + factor(YOB) + bord + age_birth, data = FinalDataset)
+
+
+
+se_bw_exmob_mob1 <- sqrt(diag(vcovCL(second_bw_exmob_mob1, cluster = ~district_matched, type = "HC1")))
+se_lbw_exmob_mob1 <- sqrt(diag(vcovCL(second_lbw_exmob_mob1, cluster = ~district_matched, type = "HC1")))
+se_vlbw_exmob_mob1 <- sqrt(diag(vcovCL(second_vlbw_exmob_mob1, cluster = ~district_matched, type = "HC1")))
+
+se_bw_exmob_mob1_mob2 <- sqrt(diag(vcovCL(second_bw_exmob_mob1_mob2, cluster = ~district_matched, type = "HC1")))
+se_lbw_exmob_mob1_mob2 <- sqrt(diag(vcovCL(second_lbw_exmob_mob1_mob2, cluster = ~district_matched, type = "HC1")))
+se_vlbw_exmob_mob1_mob2 <- sqrt(diag(vcovCL(second_vlbw_exmob_mob1_mob2, cluster = ~district_matched, type = "HC1")))
+
+stargazer(
+  second_bw_exmob_mob1, second_lbw_exmob_mob1, second_vlbw_exmob_mob1,
+  type = "text",
+  se = list(se_bw_exmob_mob1, se_lbw_exmob_mob1, se_vlbw_exmob_mob1),
+  keep = "preg_hat_exmob_mob1",
+  omit.stat = c("f", "ser"),
+  column.labels = c("Birthweight", "LBW", "VLBW"),
+  dep.var.labels = "Outcomes (Excl. MOB + 1)",
+  digits = 5
+)
+
+stargazer(
+  second_bw_exmob_mob1_mob2, second_lbw_exmob_mob1_mob2, second_vlbw_exmob_mob1_mob2,
+  type = "text",
+  se = list(se_bw_exmob_mob1_mob2, se_lbw_exmob_mob1_mob2, se_vlbw_exmob_mob1_mob2),
+  keep = "preg_hat_exmob_mob1_mob2",
+  omit.stat = c("f", "ser"),
+  column.labels = c("Birthweight", "LBW", "VLBW"),
+  dep.var.labels = "Outcomes (Excl. MOB + 1 + 2)",
+  digits = 5
+)
+
+
+```
+
+
+#Each year allowed to have different coefficient, differential impact of wind direction over years
+```{r}
+first_stageYear <- lm(
+  tri_cumulative ~ avg_north_share_cumulative:factor(region):factor(YOB) +
+                   avg_east_share_cumulative:factor(region):factor(YOB)  +   avg_south_share_cumulative:factor(region):factor(YOB)  + avg_wind_speed_cumulative +religion+minoritycastetribe+cooking+female+urban+bmi+wealth_index+ anemia + +avg_temperature_cumulative+ factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+  data = FinalDataset
+)
+
+# Save the predicted values of tri_cumulative
+FinalDataset$tri_cumulative_hatYear <- predict(first_stageYear)
+
+
+LBWYear <- lm(
+  LBW ~ tri_cumulative_hatYear + avg_temperature_cumulative + avg_wind_speed_cumulative + minoritycastetribe + religion + cooking + female + urban + bmi + wealth_index + anemia + factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+  data = FinalDataset
+)
+
+VLBWYear <- lm(
+  VLBW ~ tri_cumulative_hatYear + avg_temperature_cumulative + avg_wind_speed_cumulative + minoritycastetribe + religion + cooking + female + urban + bmi + wealth_index + anemia + factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+  data = FinalDataset
+)
+
+
+stargazer(LBWYear,VLBWYear, type='text', omit='factor')
+```
+
+#Heterogeneity in wind direction by month in order to overcome Monotonicity issues
+```{r}
+first_stageMonth <- lm(
+  tri_cumulative ~ avg_north_share_cumulative:factor(region):factor(MOB) +
+                   avg_east_share_cumulative:factor(region):factor(MOB)  +   avg_south_share_cumulative:factor(region):factor(MOB)  + avg_wind_speed_cumulative +religion+minoritycastetribe+cooking+female+urban+bmi+wealth_index+ anemia + +avg_temperature_cumulative+ factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+  data = FinalDataset
+)
+
+# Save the predicted values of tri_cumulative
+FinalDataset$tri_cumulative_hatMonth <- predict(first_stageMonth)
+
+
+BWMonth <- lm(
+  brthwt ~ tri_cumulative_hatMonth + avg_temperature_cumulative + avg_wind_speed_cumulative + minoritycastetribe + religion + cooking + female + urban + bmi + wealth_index + anemia + factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+  data = FinalDataset
+)
+
+LBWMonth <- lm(
+  LBW ~ tri_cumulative_hatMonth + avg_temperature_cumulative + avg_wind_speed_cumulative + minoritycastetribe + religion + cooking + female + urban + bmi + wealth_index + anemia + factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+  data = FinalDataset
+)
+
+VLBWMonth <- lm(
+  VLBW ~ tri_cumulative_hatMonth + avg_temperature_cumulative + avg_wind_speed_cumulative + minoritycastetribe + religion + cooking + female + urban + bmi + wealth_index + anemia + factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+  data = FinalDataset
+)
+
+stargazer(BWMonth, LBWMonth,VLBWMonth, type='text', omit='factor')
+```
+
+
+
+#Adding covariates/FE one by one
+```{r}
+#No Region*MonthFE
+first_stageNoRMFE <- lm(
+  tri_cumulative ~ avg_north_share_cumulative:factor(region) +
+                   avg_east_share_cumulative:factor(region)  +   avg_south_share_cumulative:factor(region)  + 
+                   avg_temperature_cumulative  + avg_wind_speed_cumulative +religion+minoritycastetribe+cooking+female+urban+bmi+wealth_index+ anemia + factor(YOB) + bord + age_birth,
+  data = FinalDataset
+)
+
+
+# Save the predicted values of tri_cumulative
+FinalDataset$tri_cumulative_hatNoRMFE <- predict(first_stageNoRMFE)
+
+second_stageNoRMFE <- lm(
+    brthwt ~ tri_cumulative_hatNoRMFE + avg_temperature_cumulative  + avg_wind_speed_cumulative +minoritycastetribe+religion+cooking+female+urban+bmi+wealth_index+anemia + factor(YOB) + bord + age_birth ,
+  data = FinalDataset
+)
+
+# Calculate clustered standard errors at the district level
+cluster_seNoRMFE <- vcovCL(second_stageNoRMFE, cluster = ~code, type='HC1')
+
+# Display results with clustered standard errors
+summary_clusteredNoRMFE <- coeftest(second_stageNoRMFE, vcov. = cluster_seNoRMFE)
+
+# OLS counterpart
+ols_NoRMFE <- lm(
+  brthwt ~ tri_cumulative + avg_temperature_cumulative + avg_wind_speed_cumulative +
+    religion + minoritycastetribe + cooking + female + urban + bmi + wealth_index +
+    anemia + factor(YOB) + bord + age_birth,
+  data = FinalDataset
+)
+cluster_se_ols_NoRMFE <- vcovCL(ols_NoRMFE, cluster = ~code, type = 'HC1')
+
+# Stargazer output
+stargazer(
+  second_stageNoRMFE, ols_NoRMFE,
+  se = list(sqrt(diag(cluster_seNoRMFE)), sqrt(diag(cluster_se_ols_NoRMFE))),
+  type = "text", omit = 'factor',
+  column.labels = c("IV", "OLS"),
+  title = "2SLS vs OLS: No Region×Month Fixed Effects"
+)
+
+#No Demographic Covariates (only weather)
+
+first_stageNoControls <- lm(
+  tri_cumulative ~ avg_north_share_cumulative:factor(region) +
+                   avg_east_share_cumulative:factor(region)  +   avg_south_share_cumulative:factor(region)  + 
+                   avg_temperature_cumulative  + avg_wind_speed_cumulative + factor(region):factor(MOB) + factor(YOB),
+  data = FinalDataset
+)
+
+
+# Save the predicted values of tri_cumulative
+FinalDataset$tri_cumulative_hatNoControls <- predict(first_stageNoControls)
+
+second_stageNoControls <- lm(
+    brthwt ~ tri_cumulative_hatNoControls + avg_temperature_cumulative  + avg_wind_speed_cumulative + factor(YOB) + factor(region):factor(MOB) ,
+  data = FinalDataset
+)
+
+# Calculate clustered standard errors at the district level
+cluster_seNoControls <- vcovCL(second_stageNoControls, cluster = ~code, type='HC1')
+
+# Display results with clustered standard errors
+summary_clusteredNoControls <- coeftest(second_stageNoControls, vcov. = cluster_seNoControls)
+
+# OLS counterpart
+ols_NoControls <- lm(
+  brthwt ~ tri_cumulative + avg_temperature_cumulative + avg_wind_speed_cumulative +
+    factor(YOB) + factor(region):factor(MOB),
+  data = FinalDataset
+)
+cluster_se_ols_NoControls <- vcovCL(ols_NoControls, cluster = ~code, type = 'HC1')
+
+# Stargazer output
+stargazer(
+  second_stageNoControls, ols_NoControls,
+  se = list(sqrt(diag(cluster_seNoControls)), sqrt(diag(cluster_se_ols_NoControls))),
+  type = "text", omit = 'factor',
+  column.labels = c("IV", "OLS"),
+  title = "2SLS vs OLS: No Demographic Controls"
+)
+
+
+#No FEs at all
+first_stageNoFE <- lm(
+  tri_cumulative ~ avg_north_share_cumulative:factor(region) +
+                   avg_east_share_cumulative:factor(region)  +   avg_south_share_cumulative:factor(region)  + 
+                   avg_temperature_cumulative  + avg_wind_speed_cumulative +religion+minoritycastetribe+cooking+female+urban+bmi+wealth_index+ anemia + bord + age_birth,
+  data = FinalDataset
+)
+
+
+# Save the predicted values of tri_cumulative
+FinalDataset$tri_cumulative_hatNoFE <- predict(first_stageNoFE)
+
+second_stageNoFE <- lm(
+    brthwt ~ tri_cumulative_hatNoFE + avg_temperature_cumulative  + avg_wind_speed_cumulative +minoritycastetribe+religion+cooking+female+urban+bmi+wealth_index+anemia + bord + age_birth ,
+  data = FinalDataset
+)
+
+# Calculate clustered standard errors at the district level
+cluster_seNoFE <- vcovCL(second_stageNoFE, cluster = ~code, type='HC1')
+
+# Display results with clustered standard errors
+summary_clusteredNoFE <- coeftest(second_stageNoFE, vcov. = cluster_seNoFE)
+
+
+# OLS counterpart
+ols_NoFE <- lm(
+  brthwt ~ tri_cumulative + avg_temperature_cumulative + avg_wind_speed_cumulative +
+    religion + minoritycastetribe + cooking + female + urban + bmi + wealth_index +
+    anemia + bord + age_birth,
+  data = FinalDataset
+)
+cluster_se_ols_NoFE <- vcovCL(ols_NoFE, cluster = ~code, type = 'HC1')
+
+# Stargazer output
+stargazer(
+  second_stageNoFE, ols_NoFE,
+  se = list(sqrt(diag(cluster_seNoFE)), sqrt(diag(cluster_se_ols_NoFE))),
+  type = "text", omit = 'factor',
+  column.labels = c("IV", "OLS"),
+  title = "2SLS vs OLS: No Fixed Effects"
+)
+#No YOB FE
+# -------- FIRST STAGE --------
+first_stage_RegionMonth_NoYOBFE <- lm(
+  tri_cumulative ~ avg_north_share_cumulative:factor(region) +
+                   avg_east_share_cumulative:factor(region) +
+                   avg_south_share_cumulative:factor(region) +
+                   avg_temperature_cumulative + avg_wind_speed_cumulative +
+                   religion + minoritycastetribe + cooking + female + urban +
+                   bmi + wealth_index + anemia + bord + age_birth +
+                   factor(region):factor(MOB),  # keep Region×Month FE
+  data = FinalDataset
+)
+
+FinalDataset$tri_cumulative_hat_RegionMonth_NoYOBFE <- predict(first_stage_RegionMonth_NoYOBFE)
+
+# -------- SECOND STAGE IV --------
+second_stage_RegionMonth_NoYOBFE <- lm(
+  brthwt ~ tri_cumulative_hat_RegionMonth_NoYOBFE + avg_temperature_cumulative +
+           avg_wind_speed_cumulative + religion + minoritycastetribe +
+           cooking + female + urban + bmi + wealth_index + anemia +
+           bord + age_birth + factor(region):factor(MOB),  # keep Region×Month FE
+  data = FinalDataset
+)
+cluster_se_IV_RegionMonth_NoYOBFE <- vcovCL(second_stage_RegionMonth_NoYOBFE, cluster = ~code, type = 'HC1')
+
+# -------- SIMPLE OLS --------
+ols_RegionMonth_NoYOBFE <- lm(
+  brthwt ~ tri_cumulative + avg_temperature_cumulative +
+           avg_wind_speed_cumulative + religion + minoritycastetribe +
+           cooking + female + urban + bmi + wealth_index + anemia +
+           bord + age_birth + factor(region):factor(MOB),
+  data = FinalDataset
+)
+cluster_se_ols_RegionMonth_NoYOBFE <- vcovCL(ols_RegionMonth_NoYOBFE, cluster = ~code, type = 'HC1')
+
+# -------- STARGAZER TABLE --------
+stargazer(
+  second_stage_RegionMonth_NoYOBFE, ols_RegionMonth_NoYOBFE,
+  se = list(sqrt(diag(cluster_se_IV_RegionMonth_NoYOBFE)), sqrt(diag(cluster_se_ols_RegionMonth_NoYOBFE))),
+  type = "text", omit = 'factor',
+  column.labels = c("IV", "OLS"),
+  title = "2SLS vs OLS: Region×Month FE, No Year-of-Birth FE"
+)
+
+
+```
+
+
+
+#Placebo Check: Randomizing Wind direction and doing 250 iterations (Not in code chunks as very time consuming to run, reinstate code chunks if you would like to see figures) 
+
+``{r}
+
+
+# Initialize result storage
+placebo_results <- data.frame(
+  Iteration = 1:250,
+  Coef_brthwt_placebo = NA, StdErr_brthwt_placebo = NA, PValue_brthwt_placebo = NA,
+  Coef_LBW_placebo = NA,    StdErr_LBW_placebo = NA,    PValue_LBW_placebo = NA,
+  Coef_VLBW_placebo = NA,   StdErr_VLBW_placebo = NA,   PValue_VLBW_placebo = NA
+)
+
+# Set seed once for reproducibility
+set.seed(7)
+n <- nrow(FinalDataset)
+
+for (i in 1:250) {
+  # Shuffle observed wind shares
+  FinalDataset$random_north_share <- sample(FinalDataset$avg_north_share_cumulative, n)
+  FinalDataset$random_east_share  <- sample(FinalDataset$avg_east_share_cumulative, n)
+  FinalDataset$random_south_share <- sample(FinalDataset$avg_south_share_cumulative, n)
+
+  # First-stage regression with placebo instruments
+  first_stage_placebo <- lm(
+    tri_cumulative ~ random_north_share:factor(region) +
+                     random_east_share:factor(region) +
+                     random_south_share:factor(region) +
+                     avg_temperature_cumulative + avg_wind_speed_cumulative +
+                     religion + minoritycastetribe + cooking + female + urban +
+                     bmi + wealth_index + anemia +
+                     factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+    data = FinalDataset
+  )
+
+  # Predicted values from placebo instruments
+  FinalDataset$tri_cumulative_hatplacebo <- predict(first_stage_placebo)
+
+  ## Second-stage 1: brthwt
+  second_stage_brthwt <- lm(
+    brthwt ~ tri_cumulative_hatplacebo + avg_temperature_cumulative + avg_wind_speed_cumulative +
+      minoritycastetribe + religion + cooking + female + urban +
+      bmi + wealth_index + anemia + factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+    data = FinalDataset
+  )
+  cluster_se_brthwt <- vcovCL(second_stage_brthwt, cluster = ~code, type = "HC1")
+  summary_brthwt <- coeftest(second_stage_brthwt, vcov. = cluster_se_brthwt)
+
+  ## Second-stage 2: LBW
+  second_stage_LBW <- lm(
+    LBW ~ tri_cumulative_hatplacebo + avg_temperature_cumulative + avg_wind_speed_cumulative +
+      minoritycastetribe + religion + cooking + female + urban +
+      bmi + wealth_index + anemia + factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+    data = FinalDataset
+  )
+  cluster_se_LBW <- vcovCL(second_stage_LBW, cluster = ~code, type = "HC1")
+  summary_LBW <- coeftest(second_stage_LBW, vcov. = cluster_se_LBW)
+
+  ## Second-stage 3: VLBW
+  second_stage_VLBW <- lm(
+    VLBW ~ tri_cumulative_hatplacebo + avg_temperature_cumulative + avg_wind_speed_cumulative +
+      minoritycastetribe + religion + cooking + female + urban +
+      bmi + wealth_index + anemia + factor(region):factor(MOB) + factor(YOB) + bord + age_birth,
+    data = FinalDataset
+  )
+  cluster_se_VLBW <- vcovCL(second_stage_VLBW, cluster = ~code, type = "HC1")
+  summary_VLBW <- coeftest(second_stage_VLBW, vcov. = cluster_se_VLBW)
+
+  ## Save placebo estimates
+  placebo_results$Coef_brthwt_placebo[i]   <- summary_brthwt["tri_cumulative_hatplacebo", "Estimate"]
+  placebo_results$StdErr_brthwt_placebo[i] <- summary_brthwt["tri_cumulative_hatplacebo", "Std. Error"]
+  placebo_results$PValue_brthwt_placebo[i] <- summary_brthwt["tri_cumulative_hatplacebo", "Pr(>|t|)"]
+
+  placebo_results$Coef_LBW_placebo[i]   <- summary_LBW["tri_cumulative_hatplacebo", "Estimate"]
+  placebo_results$StdErr_LBW_placebo[i] <- summary_LBW["tri_cumulative_hatplacebo", "Std. Error"]
+  placebo_results$PValue_LBW_placebo[i] <- summary_LBW["tri_cumulative_hatplacebo", "Pr(>|t|)"]
+
+  placebo_results$Coef_VLBW_placebo[i]   <- summary_VLBW["tri_cumulative_hatplacebo", "Estimate"]
+  placebo_results$StdErr_VLBW_placebo[i] <- summary_VLBW["tri_cumulative_hatplacebo", "Std. Error"]
+  placebo_results$PValue_VLBW_placebo[i] <- summary_VLBW["tri_cumulative_hatplacebo", "Pr(>|t|)"]
+
+  cat(sprintf("Iteration %d complete\n", i))
+}
+
+# Final results with placebo runs df
+print(head(placebo_results))
+
+
+
+
+``
+#Plot from placebo check!
+``{r}
+ggplot(placebo_results,aes(x=Coef_brthwt_placebo)) + geom_histogram()
+
+ggplot(placebo_results,aes(x=Coef_LBW_placebo)) + geom_histogram()
+
+ggplot(placebo_results,aes(x=Coef_VLBW_placebo)) + geom_histogram()
+
+
+``
+
+
+``{r}
+
+library(ggplot2)
+library(dplyr)
+
+placebo_plot_df <- placebo_results %>%
+  mutate(
+    index = row_number(),
+    sig = ifelse(PValue_brthwt_placebo < 0.05, "p < 0.05", "p ≥ 0.05")
+  )
+
+ggplot(placebo_plot_df, aes(x = index, y = Coef_brthwt_placebo, color = sig)) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50",linewidth=1.1) +
+  geom_hline(yintercept = -2.2, linetype = "dashed", color = "blue", linewidth = 1.1) +
+  scale_color_manual(values = c("p < 0.05" = "red", "p ≥ 0.05" = "black")) +
+  labs(
+    x = "Placebo iteration",
+    y = "Placebo BW Coefficient",
+    color = "Significance"
+  ) + theme_minimal() +
+  theme(
+    axis.title.x = element_text(face = "bold"),
+    axis.title.y = element_text(face = "bold")
+  )
+
+
+``
+
+``{r}
+placebo_plot_lbw <- placebo_results %>%
+  mutate(
+    index = row_number(),
+    sig = ifelse(PValue_LBW_placebo < 0.05, "p < 0.05", "p ≥ 0.05")
+  )
+
+ggplot(placebo_plot_lbw, aes(x = index, y = Coef_LBW_placebo, color = sig)) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50", linewidth=1.1) +
+  geom_hline(yintercept = 0.002, linetype = "dashed", color = "blue", linewidth = 1) +
+  scale_color_manual(values = c("p < 0.05" = "red", "p ≥ 0.05" = "black")) +
+  labs( x = "Placebo iteration",
+    y = "Placebo LBW Coefficient",
+    color = "Significance"
+  ) + theme_minimal() +
+  theme(
+    axis.title.x = element_text(face = "bold"),
+    axis.title.y = element_text(face = "bold")
+  )
+
+``
+``{r}
+placebo_plot_vlbw <- placebo_results %>%
+  mutate(
+    index = row_number(),
+    sig = ifelse(PValue_VLBW_placebo < 0.05, "p < 0.05", "p ≥ 0.05")
+  )
+
+ggplot(placebo_plot_vlbw, aes(x = index, y = Coef_VLBW_placebo, color = sig)) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50", linewidth=1.1) +
+  geom_hline(yintercept = 0.00050, linetype = "dashed", color = "blue", linewidth = 1.1) +
+  scale_color_manual(values = c("p < 0.05" = "red", "p ≥ 0.05" = "black")) +
+  labs(
+    x = "Placebo iteration",
+    y = "Placebo VLBW Coefficient",
+    color = "Significance"
+  ) +
+  theme_minimal()
+
+``
+#Code on how to make predicted vs actual pollution for regions and region*seasons full PDF
+```{r}
+
+
+
+# =========================
+# 1) DATA: seasons
+# =========================
+
+df_season <- FinalDataset %>%
+  filter(region %in% 29:0, MOB %in% 1:12) %>%
+  mutate(
+    season = case_when(
+      MOB %in% 1:3   ~ "Jan–Mar",
+      MOB %in% 4:6   ~ "Apr–Jun",
+      MOB %in% 7:9   ~ "Jul–Sep",
+      MOB %in% 10:12 ~ "Oct–Dec"
+    ),
+    region = factor(region, levels = 29:0)
+  ) %>%
+  select(region, season, tri_cumulative_hat, tri_cumulative) %>%
+  pivot_longer(
+    cols = c(tri_cumulative_hat, tri_cumulative),
+    names_to = "type",
+    values_to = "pm25"
+  ) %>%
+  mutate(
+    type = dplyr::recode(
+      type,
+      "tri_cumulative_hat" = "Predicted (IV)",
+      "tri_cumulative"     = "Actual"
+    )
+  )
+
+# =========================
+# 2) DATA: overall as extra facet
+# =========================
+
+df_overall <- FinalDataset %>%
+  filter(region %in% 29:0, MOB %in% 1:12) %>%
+  mutate(
+    season = "Overall",
+    region = factor(region, levels = 29:0)
+  ) %>%
+  select(region, season, tri_cumulative_hat, tri_cumulative) %>%
+  pivot_longer(
+    cols = c(tri_cumulative_hat, tri_cumulative),
+    names_to = "type",
+    values_to = "pm25"
+  ) %>%
+  mutate(
+    type = dplyr::recode(
+      type,
+      "tri_cumulative_hat" = "Predicted (IV)",
+      "tri_cumulative"     = "Actual"
+    )
+  )
+
+# combine seasonal + overall facets
+df_long_full <- bind_rows(df_season, df_overall) %>%
+  mutate(
+    season = factor(
+      season,
+      levels = c("Jan–Mar", "Apr–Jun", "Jul–Sep", "Oct–Dec", "Overall")
+    )
+  )
+
+# =========================
+# 3) Quantiles: only for Overall facet
+# =========================
+
+df_quants_overall <- df_long_full %>%
+  filter(season == "Overall") %>%
+  group_by(region, type) %>%
+  summarise(
+    q25 = quantile(pm25, 0.25, na.rm = TRUE),
+    q50 = quantile(pm25, 0.50, na.rm = TRUE),
+    q75 = quantile(pm25, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# =========================
+# 3b) ONE SUMMARY BOX PER REGION
+# =========================
+
+df_labels <- df_quants_overall %>%
+  tidyr::pivot_longer(
+    cols      = c(q25, q50, q75),
+    names_to  = "quantile",
+    values_to = "value"
+  ) %>%
+  mutate(
+    quantile = dplyr::recode(
+      quantile,
+      "q25" = "25th",
+      "q50" = "50th",
+      "q75" = "75th"
+    )
+  ) %>%
+  group_by(region) %>%
+  summarise(
+    label = paste0(
+      "Predicted (IV):\n",
+      "  25th: ", sprintf("%.1f", value[type == "Predicted (IV)" & quantile == "25th"]), "\n",
+      "  50th: ", sprintf("%.1f", value[type == "Predicted (IV)" & quantile == "50th"]), "\n",
+      "  75th: ", sprintf("%.1f", value[type == "Predicted (IV)" & quantile == "75th"]), "\n\n",
+      "Actual:\n",
+      "  25th: ", sprintf("%.1f", value[type == "Actual" & quantile == "25th"]), "\n",
+      "  50th: ", sprintf("%.1f", value[type == "Actual" & quantile == "50th"]), "\n",
+      "  75th: ", sprintf("%.1f", value[type == "Actual" & quantile == "75th"])
+    ),
+    season = "Overall",
+    x = Inf,
+    y = Inf,
+    hjust = 1.1,
+    vjust = 1.1,
+    .groups = "drop"
+  )
+
+# =========================
+# 4) Plot base + paginate
+# =========================
+
+ncol <- 4  # 4 regions per page
+nrow <- 5
+
+p_base <- ggplot(df_long_full, aes(x = pm25, color = type, linetype = type)) +
+  geom_density(size = 0.7, adjust = 1, na.rm = TRUE) +
+
+  # quantile dots (still included)
+  geom_point(
+    data = df_quants_overall %>%
+      tidyr::pivot_longer(
+        cols      = c(q25, q50, q75),
+        names_to  = "quantile",
+        values_to = "pm25"
+      ) %>%
+      mutate(
+        quantile = dplyr::recode(
+          quantile,
+          "q25" = "25th",
+          "q50" = "50th",
+          "q75" = "75th"
+        ),
+        season = "Overall"
+      ),
+    aes(
+      x     = pm25,
+      y     = 0,
+      shape = quantile,
+      color = type
+    ),
+    size        = 1.6,
+    inherit.aes = FALSE
+  ) +
+
+  # ONE box per region (clean)
+  geom_label(
+    data = df_labels,
+    aes(x = x, y = y, label = label, hjust = hjust, vjust = vjust),
+    fill        = "white",
+    label.size  = 0.3,
+    size        = 2.6,
+    alpha       = 0.85,
+    inherit.aes = FALSE
+  ) +
+
+  theme_minimal(base_size = 12) +
+  labs(
+    title = expression(bold("Predicted vs. Actual PM2.5 by Region (4 Seasons + Overall)")),
+    x     = "PM2.5 (μg/m³)",
+    y     = "Density"
+  ) +
+  theme(
+    legend.position      = "bottom",
+    panel.grid.minor     = element_blank(),
+    panel.grid.major.x   = element_blank()
+  )
+
+# count pages
+p_first <- p_base + ggforce::facet_grid_paginate(
+  season ~ region,
+  ncol   = ncol,
+  nrow   = nrow,
+  page   = 1,
+  scales = "free_x"
+)
+n_pages <- ggforce::n_pages(p_first)
+
+# =========================
+# 5) PDF output (title only on first page)
+# =========================
+
+pdf("pm25_region_SeasonAndOverall_ONEBOX.pdf", width = 10, height = 10)
+
+for (i in 1:n_pages) {
+
+  if (i == 1) {
+    # First page: keep title
+    p_out <- p_base
+  } else {
+    # Other pages: remove title
+    p_out <- p_base + theme(plot.title = element_blank())
+  }
+
+  print(
+    p_out +
+      ggforce::facet_grid_paginate(
+        season ~ region,
+        ncol   = ncol,
+        nrow   = nrow,
+        page   = i,
+        scales = "free_x"
+      )
+  )
+}
+
+dev.off()
+
+
+```
+
+
+#using fixest package (same as baseline) | Same results
+```{r}
+
+iv_mod_rmBW <- feols(
+  birthweight ~ temp_cumulative + windspeed_cumulative + i(religion_code) +
+    dirty_cookingfuel + sex_child + urban + bmi + i(wealth_index) + i(anemic) +
+    birthorder + age_birth + i(caste) |
+    region^month_birth + year_birth |
+   pm_cumulative  ~ i(region, North_share_cumulative) +
+               i(region, East_share_cumulative) +
+               i(region, South_share_cumulative),
+  data = FinalDataset,
+  vcov = ~ district_matched
+)
+
+
+iv_mod_rmLBW <- feols(
+  lbw ~ temp_cumulative + windspeed_cumulative + i(religion_code) +
+    dirty_cookingfuel + sex_child + urban + bmi + i(wealth_index) + i(anemic) +
+    birthorder + age_birth + i(caste) |
+    region^month_birth + year_birth |
+   pm_cumulative  ~ i(region, North_share_cumulative) +
+               i(region, East_share_cumulative) +
+               i(region, South_share_cumulative),
+  data = FinalDataset,
+  vcov = ~ district_matched
+)
+
+
+
+iv_mod_rmVLBW <- feols(
+  vlbw ~ temp_cumulative + windspeed_cumulative + i(religion_code) +
+    dirty_cookingfuel + sex_child + urban + bmi + i(wealth_index) + i(anemic) +
+    birthorder + age_birth + i(caste) |
+    region^month_birth + year_birth |
+   pm_cumulative  ~ i(region, North_share_cumulative) +
+               i(region, East_share_cumulative) +
+               i(region, South_share_cumulative),
+  data = FinalDataset,
+  vcov = ~ district_matched
+)
+
+
+
+summary(iv_mod_rmBW)
+summary(iv_mod_rmLBW)
+summary(iv_mod_rmVLBW)
+
+```
