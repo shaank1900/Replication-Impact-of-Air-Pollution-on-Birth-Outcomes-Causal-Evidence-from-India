@@ -1,6 +1,6 @@
 # Air Pollution and Birth Outcomes: Causal Evidence from India
 
-Replication repository · *Journal of Environmental Economics and Management* (forthcoming)
+Replication repository · Misra and Kulshreshtha *Journal of Environmental Economics and Management* (forthcoming)
 
 ![R](https://img.shields.io/badge/language-R%20%2F%20R%20Markdown-blue)
 
@@ -10,7 +10,7 @@ Replication repository · *Journal of Environmental Economics and Management* (f
 
 ## Overview
 
-This repository contains the full replication code and data for the paper *Air Pollution and Birth Outcomes: Causal Evidence from India*.  *Most* results, tables, and figures in the paper can be reproduced by running the single self-contained R Markdown file provided (some analysis were done by my co-author on Stata, available upon request). The dataset required to run the analysis is included via a link below (in case the link is broken at some point please feel free to email me).
+This repository contains the replication code and data for the paper *Air Pollution and Birth Outcomes: Causal Evidence from India*.  *Most* results, tables, and figures in the paper can be reproduced by running the single self-contained R Markdown file provided (some analysis were done by my co-author on Stata, available upon request). The dataset required to run the analysis is included via a link below (in case the link is broken at some point please feel free to email me).
 
 ---
 
