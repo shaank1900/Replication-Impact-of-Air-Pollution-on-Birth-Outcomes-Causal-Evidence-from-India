@@ -1,6 +1,6 @@
 # Air Pollution and Birth Outcomes: Causal Evidence from India
 
-Replication repository · Misra and Kulshreshtha *Journal of Environmental Economics and Management* (forthcoming)
+Replication repository · Misra and Kulshreshtha *Journal of Environmental Economics and Management* (2026)
 
 ![R](https://img.shields.io/badge/language-R%20%2F%20R%20Markdown-blue)
 
